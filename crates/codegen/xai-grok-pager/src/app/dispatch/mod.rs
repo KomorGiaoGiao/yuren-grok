@@ -13,7 +13,7 @@ mod auth;
 mod billing;
 mod cta;
 mod ctx;
-mod dashboard;
+pub(crate) mod dashboard;
 mod dashboard_telemetry;
 pub(crate) mod external_editor;
 mod import_claude;

@@ -671,15 +671,24 @@ fn suspend_retry_ready(retry_after: Option<Instant>, now: Instant) -> bool {
 struct SuspendWaitReports {
     editor_reported: bool,
     pager_reported: bool,
+    folder_reported: bool,
 }
 
 impl SuspendWaitReports {
-    fn reset_missing(&mut self, editor_pending: bool, pager_pending: bool) {
+    fn reset_missing(
+        &mut self,
+        editor_pending: bool,
+        pager_pending: bool,
+        folder_pending: bool,
+    ) {
         if !editor_pending {
             self.editor_reported = false;
         }
         if !pager_pending {
             self.pager_reported = false;
+        }
+        if !folder_pending {
+            self.folder_reported = false;
         }
     }
 }
@@ -699,6 +708,7 @@ fn defer_suspend_retry(
 
 const EDITOR_SUSPEND_WAIT: &str = "Editor is waiting for a safe terminal handoff";
 const TRANSCRIPT_SUSPEND_WAIT: &str = "Transcript is waiting for a safe terminal handoff";
+const FOLDER_SUSPEND_WAIT: &str = "Folder picker is waiting for a safe terminal handoff";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SuspendWaitSink {
@@ -789,13 +799,14 @@ fn run_pending_suspends(
 ) -> anyhow::Result<()> {
     let editor_pending = app.pending_editor.is_some();
     let pager_pending = app.pending_pager_path.is_some();
-    suspend_wait_reports.reset_missing(editor_pending, pager_pending);
+    let folder_pending = app.pending_folder_picker.is_some();
+    suspend_wait_reports.reset_missing(editor_pending, pager_pending, folder_pending);
     if !suspend_retry_ready(*suspend_retry_after, Instant::now()) {
         return Ok(());
     }
     // The gate is consumed before any blocking park/drain attempt
     // A timeout must arm a fresh deadline before this function returns
-    if !editor_pending && !pager_pending {
+    if !editor_pending && !pager_pending && !folder_pending {
         *suspend_retry_after = None;
         return Ok(());
     }
@@ -933,6 +944,77 @@ fn run_pending_suspends(
         restore_after_child(terminal, app.screen_mode, moved_cursor);
         presenter.request_presentation(app, terminal, true);
         suspend_wait_reports.pager_reported = false;
+    }
+
+    // Native folder dialog (dashboard location Browse…): suspend, pick a directory, apply on success
+    if let Some(initial) = app.pending_folder_picker.take() {
+        let retry_initial = initial.clone();
+        let mut outcome = crate::native_folder_dialog::FolderPickOutcome::Cancelled;
+        let moved_cursor = match suspend_for_child(
+            app.screen_mode,
+            terminal,
+            input_paused,
+            reader_parked,
+            input_rx,
+            || {
+                outcome = crate::native_folder_dialog::pick_folder(Some(&initial));
+            },
+        ) {
+            Ok(moved_cursor) => moved_cursor,
+            Err(error) if error.kind() == std::io::ErrorKind::TimedOut => {
+                requeue_after_suspend_timeout(&mut app.pending_folder_picker, retry_initial);
+                let first_timeout = defer_suspend_retry(
+                    suspend_retry_after,
+                    &mut suspend_wait_reports.folder_reported,
+                    Instant::now(),
+                );
+                if first_timeout {
+                    report_suspend_wait(app, FOLDER_SUSPEND_WAIT);
+                    presenter.request_presentation(app, terminal, false);
+                }
+                return Ok(());
+            }
+            Err(error) => return Err(error.into()),
+        };
+        restore_after_child(terminal, app.screen_mode, moved_cursor);
+        let create_after = app.pending_create_after_folder_pick;
+        match outcome {
+            crate::native_folder_dialog::FolderPickOutcome::Picked(path) => {
+                let effects = crate::app::dispatch::dispatch(
+                    crate::app::actions::Action::DashboardChangeLocation {
+                        input: path.to_string_lossy().into_owned(),
+                    },
+                    app,
+                );
+                app.pending_effects.extend(effects);
+                if create_after {
+                    // Keep the flag set so create skips re-arming another folder dialog.
+                    let create_effects = crate::app::dispatch::dispatch(
+                        crate::app::actions::Action::DashboardCreateNewAgentWithDetail,
+                        app,
+                    );
+                    app.pending_create_after_folder_pick = false;
+                    app.pending_effects.extend(create_effects);
+                }
+            }
+            crate::native_folder_dialog::FolderPickOutcome::Cancelled => {
+                app.pending_create_after_folder_pick = false;
+            }
+            crate::native_folder_dialog::FolderPickOutcome::Unavailable(msg) => {
+                app.pending_create_after_folder_pick = false;
+                if let Some(lp) = app
+                    .dashboard
+                    .as_mut()
+                    .and_then(|d| d.location_picker.as_mut())
+                {
+                    lp.error = Some(msg);
+                } else {
+                    app.show_toast(&msg);
+                }
+            }
+        }
+        presenter.request_presentation(app, terminal, true);
+        suspend_wait_reports.folder_reported = false;
     }
     Ok(())
 }
@@ -2353,7 +2435,8 @@ pub(crate) async fn run(
         // Applies in both modes: leader mode polls the live roster, non-leader mode polls the local on-disk idle-session list
         if !app.workspace_dashboard_enabled
             && roster_poll_at.is_none()
-            && matches!(app.active_view, ActiveView::AgentDashboard)
+            && (matches!(app.active_view, ActiveView::AgentDashboard)
+                || (app.dashboard.is_some() && app.dashboard_sidebar_enabled))
         {
             roster_poll_at = Some(Instant::now());
         }
@@ -2411,7 +2494,10 @@ pub(crate) async fn run(
         };
 
         // Wake a deferred suspend retry without requiring unrelated input.
-        let suspend_retry_at = if app.pending_editor.is_some() || app.pending_pager_path.is_some() {
+        let suspend_retry_at = if app.pending_editor.is_some()
+            || app.pending_pager_path.is_some()
+            || app.pending_folder_picker.is_some()
+        {
             suspend_retry_after
         } else {
             None
@@ -2846,7 +2932,8 @@ pub(crate) async fn run(
                 // When it is not active we deliberately do NOT re-arm, so the loop isn't woken once per second forever
                 // In leader mode we poll the live FleetView roster
                 // Outside leader mode we poll the local on-disk idle-session list so the dashboard still shows idle sessions
-                let dashboard_open = matches!(app.active_view, ActiveView::AgentDashboard);
+                let dashboard_open = matches!(app.active_view, ActiveView::AgentDashboard)
+                    || (app.dashboard.is_some() && app.dashboard_sidebar_enabled);
                 if dashboard_open && !app.workspace_dashboard_enabled {
                     let eff = if leader_status_rx.is_some() {
                         Effect::FetchRoster
@@ -3529,7 +3616,9 @@ struct RoutedInputEvent {
 }
 
 fn tty_suspend_armed(app: &AppView) -> bool {
-    app.pending_editor.is_some() || app.pending_pager_path.is_some()
+    app.pending_editor.is_some()
+        || app.pending_pager_path.is_some()
+        || app.pending_folder_picker.is_some()
 }
 
 fn normalize_input_event(
@@ -5498,7 +5587,7 @@ mod tests {
             now
         ));
 
-        reports.reset_missing(false, false);
+        reports.reset_missing(false, false, false);
         assert!(!reports.editor_reported);
         retry_after = None;
         assert!(defer_suspend_retry(

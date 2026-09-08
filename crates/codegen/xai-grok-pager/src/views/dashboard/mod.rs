@@ -21,22 +21,29 @@ pub mod peek;
 pub mod peek_tail;
 pub mod render;
 pub mod row;
+pub mod sidebar;
 pub mod state;
 
+pub use layout::{
+    SIDEBAR_DIVIDER_COLS, SIDEBAR_MIN_MAIN, SIDEBAR_WIDTH, SIDEBAR_WIDTH_DEFAULT, SIDEBAR_WIDTH_MAX,
+    SIDEBAR_WIDTH_MIN, SidebarLayout, clamp_sidebar_width, compute_sidebar_layout,
+    render_sidebar_divider, sidebar_fits, split_sidebar_main,
+};
 pub use render::render_dashboard;
 pub use render::{
-    DashboardOverlayChrome, HeaderUpgradeCta, popup_rect, render_dashboard_session_header,
-    render_dashboard_session_overlay, render_popup_overlay,
+    DashboardOverlayChrome, HeaderUpgradeCta, popup_rect, render_dashboard_overlays,
+    render_dashboard_session_header, render_dashboard_session_overlay, render_popup_overlay,
 };
+pub use sidebar::render_dashboard_sidebar;
 pub use row::{
     DashboardRow, RowBadge, build_rows, build_rows_with_roster, build_rows_with_workspace,
     classify_subagent, classify_top_level, roster_activity_to_state, sort_rows,
 };
 pub use state::{
     DashboardDispatchMode, DashboardRowId, DashboardState, Filter, FilterValue, Focusable,
-    Grouping, LocationCandidate, LocationPickerState, PendingDispatchModel, PersistedDashboard,
-    PersistedRowId, RowState, SectionKey, SessionIdResolver, ShortcutsModalState, load_persisted,
-    parse_filter, parse_row_state_token,
+    Grouping, LOCATION_PICKER_BROWSE_SHORTCUT, LocationCandidate, LocationPickerState,
+    PendingDispatchModel, PersistedDashboard, PersistedRowId, RowState, SectionKey,
+    SessionIdResolver, ShortcutsModalState, load_persisted, parse_filter, parse_row_state_token,
 };
 
 /// Top-level agents visible in the dashboard's row list, in the exact order [`render_dashboard`] paints them.

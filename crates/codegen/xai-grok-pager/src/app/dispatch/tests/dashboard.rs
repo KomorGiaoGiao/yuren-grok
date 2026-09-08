@@ -440,6 +440,73 @@ fn open_location_picker_without_dashboard_is_noop() {
     assert!(effects.is_empty());
     assert!(app.dashboard.is_none());
 }
+
+#[test]
+fn browse_native_location_arms_pending_folder_picker() {
+    let mut app = test_app();
+    app.active_view = ActiveView::AgentDashboard;
+    app.cwd = std::env::temp_dir();
+    let mut dash = crate::views::dashboard::DashboardState::new();
+    dash.cwd = app.cwd.clone();
+    app.dashboard = Some(dash);
+    let effects = dispatch(Action::DashboardBrowseNativeLocation, &mut app);
+    assert!(effects.is_empty());
+    assert!(
+        app.dashboard
+            .as_ref()
+            .is_some_and(|d| d.location_picker.is_some()),
+        "browse should open the location picker first"
+    );
+    assert_eq!(
+        app.pending_folder_picker.as_deref(),
+        Some(app.cwd.as_path()),
+        "browse should arm the native folder dialog"
+    );
+}
+
+#[test]
+fn browse_native_location_blocked_off_dashboard() {
+    let mut app = test_app();
+    let effects = dispatch(Action::DashboardBrowseNativeLocation, &mut app);
+    assert!(effects.is_empty());
+    assert!(app.pending_folder_picker.is_none());
+}
+
+#[test]
+fn browse_native_location_works_with_sidebar_chrome() {
+    use ratatui::layout::Rect;
+    let mut app = test_app();
+    app.dashboard_sidebar_enabled = true;
+    app.last_main_rect = Some(Rect::new(0, 0, 100, 40));
+    app.dashboard = Some(crate::views::dashboard::DashboardState::new());
+    app.active_view = ActiveView::Welcome;
+    app.cwd = std::env::temp_dir();
+    let effects = dispatch(Action::DashboardBrowseNativeLocation, &mut app);
+    assert!(effects.is_empty());
+    assert!(
+        app.pending_folder_picker.is_some(),
+        "sidebar chrome must allow native Browse"
+    );
+}
+
+#[serial_test::serial(GROK_AGENT_DASHBOARD)]
+#[test]
+fn sidebar_new_agent_arms_folder_picker_instead_of_creating() {
+    use ratatui::layout::Rect;
+    let mut app = test_app();
+    app.dashboard_sidebar_enabled = true;
+    app.last_main_rect = Some(Rect::new(0, 0, 100, 40));
+    ensure_dashboard_state(&mut app);
+    app.active_view = ActiveView::Welcome;
+    let effects = dispatch(Action::DashboardCreateNewAgentWithDetail, &mut app);
+    assert!(effects.is_empty());
+    assert!(
+        app.agents.is_empty(),
+        "sidebar New must not create until a folder is picked"
+    );
+    assert!(app.pending_folder_picker.is_some());
+    assert!(app.pending_create_after_folder_pick);
+}
 /// Regression: `/cd` is gated on the dashboard being the FOREGROUND view,
 /// not merely existing. `app.dashboard` stays `Some` for the rest of the
 /// session once opened, so a stale `is_some()` check would let `/cd <path>`
@@ -6579,5 +6646,83 @@ fn dashboard_attach_build_roster_row_keeps_disk_resume() {
             }] if session_id == "build-dash-1" && cwd == std::path::Path::new("/repo")
         ),
         "expected Build disk resume with roster cwd, got {effects:?}"
+    );
+}
+
+/// Wide terminal + sidebar enabled: Ctrl+\ / OpenDashboard toggles focus without
+/// switching to fullscreen `AgentDashboard`.
+#[serial_test::serial(GROK_AGENT_DASHBOARD)]
+#[test]
+fn sidebar_open_dashboard_toggles_focus_without_agent_dashboard() {
+    use crate::app::app_view::DashboardFocusPane;
+    use ratatui::layout::Rect;
+
+    let mut app = test_app_with_agent();
+    app.dashboard_sidebar_enabled = true;
+    app.last_main_rect = Some(Rect::new(0, 0, 100, 40));
+    app.active_view = ActiveView::Welcome;
+    assert_eq!(app.dashboard_focus, DashboardFocusPane::Main);
+
+    let _ = dispatch_open_dashboard(&mut app);
+    assert!(
+        matches!(app.active_view, ActiveView::Welcome),
+        "sidebar mode must not switch to AgentDashboard"
+    );
+    assert!(app.dashboard.is_some());
+    assert_eq!(app.dashboard_focus, DashboardFocusPane::Sidebar);
+
+    let _ = dispatch_open_dashboard(&mut app);
+    assert!(matches!(app.active_view, ActiveView::Welcome));
+    assert_eq!(app.dashboard_focus, DashboardFocusPane::Main);
+}
+
+#[test]
+fn sidebar_clamp_and_split_honor_dragged_width() {
+    use crate::views::dashboard::{
+        SIDEBAR_DIVIDER_COLS, SIDEBAR_WIDTH_MIN, clamp_sidebar_width, split_sidebar_main,
+    };
+    use ratatui::layout::Rect;
+
+    let area = Rect::new(0, 0, 120, 40);
+    let wide = clamp_sidebar_width(50, area.width);
+    assert_eq!(wide, 50);
+    let (side, div, main) = split_sidebar_main(area, 50).expect("fits");
+    assert_eq!(side.width, 50);
+    assert_eq!(div.width, SIDEBAR_DIVIDER_COLS);
+    assert_eq!(main.width, 120 - 50 - SIDEBAR_DIVIDER_COLS);
+
+    let narrow = clamp_sidebar_width(1, area.width);
+    assert_eq!(narrow, SIDEBAR_WIDTH_MIN);
+}
+
+/// Attach from the sidebar leaves `active_view` as Agent, keeps dashboard state,
+/// and moves keyboard focus to the main pane.
+#[serial_test::serial(GROK_AGENT_DASHBOARD)]
+#[test]
+fn sidebar_attach_keeps_agent_view_and_dashboard_state() {
+    use crate::app::app_view::DashboardFocusPane;
+    use ratatui::layout::Rect;
+
+    let mut app = test_app_with_agent();
+    let id = *app.agents.keys().next().unwrap();
+    app.dashboard_sidebar_enabled = true;
+    app.last_main_rect = Some(Rect::new(0, 0, 100, 40));
+    app.dashboard_focus = DashboardFocusPane::Sidebar;
+    ensure_dashboard_state(&mut app);
+    app.active_view = ActiveView::Welcome;
+
+    let _ = dispatch_dashboard_attach(
+        &mut app,
+        crate::views::dashboard::DashboardRowId::TopLevel(id),
+    );
+    assert!(
+        matches!(app.active_view, ActiveView::Agent(aid) if aid == id),
+        "attach must land on Agent view"
+    );
+    assert!(app.dashboard.is_some(), "sidebar dashboard state stays mounted");
+    assert_eq!(app.dashboard_focus, DashboardFocusPane::Main);
+    assert_eq!(
+        app.dashboard.as_ref().and_then(|d| d.attached_agent),
+        Some(id)
     );
 }

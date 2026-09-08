@@ -224,6 +224,13 @@ pub enum ActiveView {
     /// The top-level Agent Dashboard. State lives in `AppView::dashboard`.
     AgentDashboard,
 }
+/// Which pane owns keyboard focus when the persistent dashboard sidebar chrome is active.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DashboardFocusPane {
+    #[default]
+    Main,
+    Sidebar,
+}
 impl ActiveView {
     /// The agent on screen, or `None` for a view that shows no single agent.
     pub fn agent_id(self) -> Option<AgentId> {
@@ -810,6 +817,13 @@ pub struct AppView {
     /// When true the event loop ensures the pager renders raw control codes (`less -R`) so the colors show instead of literal escapes.
     /// Plain-text transcripts (`/export` markdown) leave this false.
     pub pending_pager_ansi: bool,
+    /// When set, the event loop suspends the TUI and opens a native OS folder dialog.
+    /// Seeded by [`crate::app::actions::Action::DashboardBrowseNativeLocation`] with the directory to start in.
+    /// On success the chosen path is applied via `dispatch_dashboard_change_location`.
+    pub pending_folder_picker: Option<std::path::PathBuf>,
+    /// When true, a successful [`Self::pending_folder_picker`] also creates+attaches a new agent
+    /// in the chosen directory (sidebar `[+ New]` flow). Cleared on cancel / after create.
+    pub pending_create_after_folder_pick: bool,
     /// Minimal mode only: the Ctrl+T **force-show** pin for the todo panel.
     /// Minimal-mode-only per-session state, consolidated into a single field so the central `AppView` isn't peppered with loose minimal flags.
     /// Default-empty and inert outside `--minimal`; the `xai-grok-pager-minimal` crate reads/mutates it through the `crate::minimal_api` accessors.
@@ -1169,9 +1183,27 @@ pub struct AppView {
     /// Opened by `/tutorial` (also in the command palette).
     pub tutorial: Option<crate::views::tutorial::TutorialState>,
     /// Agent Dashboard state.
-    /// `Some(_)` only when the dashboard view is active (`active_view == AgentDashboard`) or recently closed.
+    /// `Some(_)` when the fullscreen dashboard is active, the persistent sidebar chrome is mounted, or recently closed.
     /// Held outside the `ActiveView` discriminant because `DashboardState` is not `Copy` (owns its prompt widget, peek panel, etc.).
     pub dashboard: Option<crate::views::dashboard::DashboardState>,
+    /// Keyboard focus pane when persistent sidebar chrome is showing (Sidebar ↔ Main).
+    pub dashboard_focus: DashboardFocusPane,
+    /// When true and terminal width fits, show the persistent left sidebar chrome (default true).
+    pub dashboard_sidebar_enabled: bool,
+    /// Current left sidebar width in columns (user-draggable; persisted).
+    pub dashboard_sidebar_width: u16,
+    /// Last-frame hit rect for the sidebar pane (mouse focus routing).
+    pub(crate) last_sidebar_rect: Option<ratatui::layout::Rect>,
+    /// Last-frame hit rect for the 1-col resize divider between sidebar and main.
+    pub(crate) last_sidebar_divider_rect: Option<ratatui::layout::Rect>,
+    /// Last-frame hit rect for the main pane (mouse focus routing).
+    pub(crate) last_main_rect: Option<ratatui::layout::Rect>,
+    /// Mouse is over the sidebar resize divider (hover highlight).
+    pub(crate) sidebar_divider_hovered: bool,
+    /// Active left-button drag resizing the sidebar (`Some(origin_col)` while dragging).
+    pub(crate) sidebar_resize_drag_origin_col: Option<u16>,
+    /// Sidebar width at drag start (so drag delta is relative to the press).
+    pub(crate) sidebar_resize_drag_origin_width: u16,
     /// Where to return when leaving the dashboard. See [`DashboardReturn`].
     pub dashboard_return: Option<DashboardReturn>,
     /// Persisted dashboard configuration (pinned rows, reorderings, grouping).
@@ -1476,6 +1508,8 @@ impl AppView {
             pending_editor: None,
             pending_pager_path: None,
             pending_pager_ansi: false,
+            pending_folder_picker: None,
+            pending_create_after_folder_pick: false,
             minimal_state: crate::minimal_api::MinimalState::default(),
             welcome_menu_index: None,
             welcome_menu_rects: Vec::new(),
@@ -1660,6 +1694,15 @@ impl AppView {
             feedback_trace_upload_pending: None,
             tutorial: None,
             dashboard: None,
+            dashboard_focus: DashboardFocusPane::Main,
+            dashboard_sidebar_enabled: true,
+            dashboard_sidebar_width: crate::views::dashboard::SIDEBAR_WIDTH_DEFAULT,
+            last_sidebar_rect: None,
+            last_sidebar_divider_rect: None,
+            sidebar_divider_hovered: false,
+            sidebar_resize_drag_origin_col: None,
+            sidebar_resize_drag_origin_width: crate::views::dashboard::SIDEBAR_WIDTH_DEFAULT,
+            last_main_rect: None,
             dashboard_return: None,
             dashboard_persisted: None,
             keyboard_normalizer: KeyboardNormalizer::from_terminal_context(),
@@ -1671,6 +1714,171 @@ impl AppView {
             voice_state: VoiceState::Idle,
         }
     }
+    /// Whether the Codex-style persistent left sidebar should paint this frame.
+    pub fn sidebar_chrome_active(&self, width: u16) -> bool {
+        self.dashboard_sidebar_enabled
+            && crate::views::dashboard::dashboard_enabled()
+            && self.dashboard.is_some()
+            && crate::views::dashboard::sidebar_fits(width)
+            && !matches!(self.active_view, ActiveView::AgentDashboard)
+    }
+
+    /// Sidebar chrome active for input routing (uses last-frame rects / terminal size).
+    pub(crate) fn sidebar_chrome_active_for_input(&self) -> bool {
+        let width = match (self.last_sidebar_rect, self.last_main_rect) {
+            (Some(side), Some(main)) => {
+                let combined = side.width.saturating_add(main.width);
+                if combined > 0 {
+                    combined
+                } else {
+                    main.width
+                }
+            }
+            (_, Some(main)) if main.width > 0 => main.width,
+            _ => self
+                .dashboard
+                .as_ref()
+                .map(|d| d.last_area.width)
+                .filter(|w| *w > 0)
+                .unwrap_or_else(|| {
+                    crossterm::terminal::size()
+                        .map(|(w, _)| w)
+                        .unwrap_or(80)
+                }),
+        };
+        self.sidebar_chrome_active(width)
+    }
+
+    fn dashboard_modal_steals_input(&self) -> bool {
+        self.dashboard.as_ref().is_some_and(|d| {
+            d.shortcuts_modal.is_some()
+                || d.location_picker.is_some()
+                || d.worktree_dialog.is_some()
+        })
+    }
+
+    fn rect_contains(rect: Option<ratatui::layout::Rect>, column: u16, row: u16) -> bool {
+        rect.is_some_and(|r| {
+            column >= r.x && column < r.x.saturating_add(r.width) && row >= r.y && row < r.y.saturating_add(r.height)
+        })
+    }
+
+    /// Sidebar chrome mouse: divider drag-resize, divider hover, pane focus, and
+    /// sidebar row/button hover even while the main pane owns keyboard focus.
+    ///
+    /// Returns `Some` when the event is fully handled (caller should return it).
+    /// Returns `None` to fall through to normal key/mouse routing.
+    fn handle_sidebar_chrome_mouse(&mut self, ev: &Event) -> Option<InputOutcome> {
+        let Event::Mouse(mouse) = ev else {
+            return None;
+        };
+        let total_w = match (self.last_sidebar_rect, self.last_main_rect) {
+            (Some(side), Some(main)) => side
+                .width
+                .saturating_add(crate::views::dashboard::SIDEBAR_DIVIDER_COLS)
+                .saturating_add(main.width),
+            _ => self.dashboard_sidebar_width.saturating_add(
+                crate::views::dashboard::SIDEBAR_DIVIDER_COLS
+                    .saturating_add(crate::views::dashboard::SIDEBAR_MIN_MAIN),
+            ),
+        };
+
+        // Active resize drag: consume all left-button motion / release.
+        if let Some(origin_col) = self.sidebar_resize_drag_origin_col {
+            match mouse.kind {
+                MouseEventKind::Drag(MouseButton::Left) | MouseEventKind::Moved => {
+                    let delta = mouse.column as i32 - origin_col as i32;
+                    let desired = (self.sidebar_resize_drag_origin_width as i32 + delta).max(0) as u16;
+                    let next =
+                        crate::views::dashboard::clamp_sidebar_width(desired, total_w.max(1));
+                    if next != self.dashboard_sidebar_width {
+                        self.dashboard_sidebar_width = next;
+                        return Some(InputOutcome::Changed);
+                    }
+                    return Some(InputOutcome::Unchanged);
+                }
+                MouseEventKind::Up(MouseButton::Left) => {
+                    self.sidebar_resize_drag_origin_col = None;
+                    self.sidebar_divider_hovered =
+                        Self::rect_contains(self.last_sidebar_divider_rect, mouse.column, mouse.row);
+                    // Persist the dragged width for the next launch.
+                    let effects =
+                        crate::app::dispatch::dashboard::dispatch_dashboard_persist(self);
+                    self.pending_effects.extend(effects);
+                    return Some(InputOutcome::Changed);
+                }
+                MouseEventKind::Down(MouseButton::Left) => {
+                    // Re-anchor if another down arrives mid-drag.
+                    self.sidebar_resize_drag_origin_col = Some(mouse.column);
+                    self.sidebar_resize_drag_origin_width = self.dashboard_sidebar_width;
+                    return Some(InputOutcome::Changed);
+                }
+                _ => {}
+            }
+        }
+
+        let on_divider =
+            Self::rect_contains(self.last_sidebar_divider_rect, mouse.column, mouse.row);
+        let on_sidebar = Self::rect_contains(self.last_sidebar_rect, mouse.column, mouse.row);
+        let on_main = Self::rect_contains(self.last_main_rect, mouse.column, mouse.row);
+
+        match mouse.kind {
+            MouseEventKind::Moved | MouseEventKind::Drag(_) => {
+                let mut changed = false;
+                if self.sidebar_divider_hovered != on_divider {
+                    self.sidebar_divider_hovered = on_divider;
+                    changed = true;
+                }
+                // Keep sidebar row / button hover alive while the main pane has focus.
+                if on_sidebar
+                    && let Some(dashboard) = self.dashboard.as_mut()
+                {
+                    let hover_outcome = dashboard.handle_input(ev, &self.registry);
+                    self.pending_effects.append(&mut dashboard.pending_effects);
+                    if !matches!(hover_outcome, InputOutcome::Unchanged) {
+                        changed = true;
+                    }
+                } else if !on_sidebar
+                    && let Some(dashboard) = self.dashboard.as_mut()
+                {
+                    // Clear stale row hover when the pointer leaves the sidebar.
+                    if dashboard.hovered_row.take().is_some()
+                        || dashboard.hovered_section.take().is_some()
+                        || dashboard.location_hit.hovered
+                        || dashboard.new_agent_button_hit.hovered
+                    {
+                        dashboard.location_hit.hovered = false;
+                        dashboard.new_agent_button_hit.hovered = false;
+                        changed = true;
+                    }
+                }
+                if changed {
+                    return Some(InputOutcome::Changed);
+                }
+                // Divider hover-only moves shouldn't fall into agent text selection.
+                if on_divider {
+                    return Some(InputOutcome::Unchanged);
+                }
+                None
+            }
+            MouseEventKind::Down(MouseButton::Left) if on_divider => {
+                self.sidebar_resize_drag_origin_col = Some(mouse.column);
+                self.sidebar_resize_drag_origin_width = self.dashboard_sidebar_width;
+                self.sidebar_divider_hovered = true;
+                return Some(InputOutcome::Changed);
+            }
+            MouseEventKind::Down(MouseButton::Left) if on_sidebar => {
+                self.dashboard_focus = DashboardFocusPane::Sidebar;
+                None // let sidebar input handle the click (row select / New / location)
+            }
+            MouseEventKind::Down(MouseButton::Left) if on_main => {
+                self.dashboard_focus = DashboardFocusPane::Main;
+                None
+            }
+            _ => None,
+        }
+    }
+
     /// Seed `deferred_model_switch` from CLI `-m`.
     /// The CLI effort token is resolved later, against the authoritative session catalog, in
     /// [`take_deferred_model_switch`](crate::app::dispatch::session::lifecycle::take_deferred_model_switch).
@@ -2509,7 +2717,32 @@ impl AppView {
         );
         #[cfg(feature = "local-workspace")]
         let session_picker_open = self.session_picker_entries.is_some() || sp_loading;
-        let outcome = match self.active_view {
+
+        // Persistent sidebar: resize-drag, divider hover, pane focus, and key routing.
+        let sidebar_chrome = self.sidebar_chrome_active_for_input();
+        if sidebar_chrome
+            && let Some(outcome) = self.handle_sidebar_chrome_mouse(ev)
+        {
+            return outcome;
+        }
+        let route_sidebar = sidebar_chrome
+            && (self.dashboard_modal_steals_input()
+                || self.dashboard_focus == DashboardFocusPane::Sidebar);
+
+        let outcome = if route_sidebar {
+            if let Some(ref mut dashboard) = self.dashboard {
+                let outcome = dashboard.handle_input_with_paste_provenance(
+                    ev,
+                    &self.registry,
+                    paste_provenance,
+                );
+                self.pending_effects.append(&mut dashboard.pending_effects);
+                outcome
+            } else {
+                InputOutcome::Unchanged
+            }
+        } else {
+            match self.active_view {
             ActiveView::Welcome => handle_welcome_input(
                 ev,
                 &mut WelcomeInputCtx {
@@ -2597,10 +2830,12 @@ impl AppView {
                 },
             ),
             ActiveView::Agent(id) => {
+                // With persistent sidebar chrome, the agent main pane is not session-overlay mode.
                 let overlay_active = self
                     .dashboard
                     .as_ref()
-                    .is_some_and(|d| d.attached_agent == Some(id));
+                    .is_some_and(|d| d.attached_agent == Some(id))
+                    && !sidebar_chrome;
                 if !overlay_active
                     && let Event::Key(key) = ev
                     && key.kind != KeyEventKind::Release
@@ -2945,6 +3180,7 @@ impl AppView {
                 } else {
                     InputOutcome::Unchanged
                 }
+            }
             }
         };
         if let InputOutcome::Action(Action::Quit) = &outcome {
@@ -4428,6 +4664,8 @@ impl AppView {
         self.sync_native_selection_mouse();
         self.maybe_trigger_small_screen_tip();
         self.maybe_trigger_ssh_wrap_tip();
+        // Mount dashboard state early so Welcome can show the persistent sidebar without Ctrl+\.
+        crate::app::dispatch::dashboard::maybe_mount_sidebar_dashboard(self);
         let compact = self.appearance.prompt.compact;
         let (header_pad_left, header_pad_right, header_pad_top) = {
             let layout_cfg = &self.appearance.scrollback.layout;
@@ -4506,6 +4744,60 @@ impl AppView {
                     (None, full_area)
                 };
             if view_area.height > 0 {
+                // Persistent left sidebar when width fits; otherwise draw into the full view_area.
+                let mut draw_area = view_area;
+                let sidebar_chrome = self.dashboard_sidebar_enabled
+                    && crate::views::dashboard::dashboard_enabled()
+                    && self.dashboard.is_some()
+                    && crate::views::dashboard::sidebar_fits(view_area.width)
+                    && !matches!(*active_view, ActiveView::AgentDashboard);
+                if sidebar_chrome {
+                    if let Some((sidebar_rect, divider_rect, main_rect)) =
+                        crate::views::dashboard::split_sidebar_main(
+                            view_area,
+                            self.dashboard_sidebar_width,
+                        )
+                    {
+                        // Keep the live width in sync with what we actually painted
+                        // (frame clamp may shrink a persisted value).
+                        self.dashboard_sidebar_width = sidebar_rect.width;
+                        self.last_sidebar_rect = Some(sidebar_rect);
+                        self.last_sidebar_divider_rect = Some(divider_rect);
+                        self.last_main_rect = Some(main_rect);
+                        let dashboard_roster: &[crate::app::roster::RosterEntry] =
+                            if self.leader_mode {
+                                &self.leader_roster
+                            } else {
+                                &self.dashboard_local_sessions
+                            };
+                        if let Some(dashboard) = self.dashboard.as_mut() {
+                            let _ = crate::views::dashboard::render_dashboard_sidebar(
+                                f.buffer_mut(),
+                                sidebar_rect,
+                                dashboard,
+                                agents,
+                                dashboard_roster,
+                                self.workspace_dashboard_enabled,
+                                self.workspace_snapshot.as_ref(),
+                            );
+                        }
+                        let theme = crate::theme::Theme::current();
+                        crate::views::dashboard::render_sidebar_divider(
+                            f.buffer_mut(),
+                            divider_rect,
+                            &theme,
+                            self.sidebar_divider_hovered,
+                            self.sidebar_resize_drag_origin_col.is_some(),
+                        );
+                        draw_area = main_rect;
+                    }
+                } else {
+                    self.last_sidebar_rect = None;
+                    self.last_sidebar_divider_rect = None;
+                    self.sidebar_divider_hovered = false;
+                    self.sidebar_resize_drag_origin_col = None;
+                    self.last_main_rect = Some(view_area);
+                }
                 match *active_view {
                     ActiveView::Welcome => {
                         let mut flags_vec: Vec<crate::views::prompt_widget::PromptFlag<'_>> =
@@ -4615,7 +4907,7 @@ impl AppView {
                             workspace_mode_ack_pending: self.welcome_local_workspace_ack_pending,
                         };
                         let result = crate::views::welcome::render_welcome(
-                            view_area,
+                            draw_area,
                             f.buffer_mut(),
                             &welcome_params,
                             &mut self.welcome_prompt,
@@ -4648,7 +4940,7 @@ impl AppView {
                         if let Some((ref msg, _)) = self.welcome_toast {
                             crate::views::welcome::paint_welcome_toast(
                                 f.buffer_mut(),
-                                view_area,
+                                draw_area,
                                 msg,
                                 self.welcome_prompt_rect,
                             );
@@ -4759,6 +5051,16 @@ impl AppView {
                             }
                         }
                         self.welcome_on_auth_url = on_url;
+                        // Dashboard modals cover the full frame (sidebar + main).
+                        if let Some(dashboard) = self.dashboard.as_mut()
+                            && crate::views::dashboard::render_dashboard_overlays(
+                                f.buffer_mut(),
+                                view_area,
+                                dashboard,
+                            )
+                        {
+                            return (None, post_flush);
+                        }
                         return (cursor, post_flush);
                     }
                     ActiveView::Agent(id) => {
@@ -4767,8 +5069,10 @@ impl AppView {
                             .dashboard
                             .as_ref()
                             .is_some_and(|d| d.attached_agent == Some(id));
+                        // Sidebar chrome replaces the session-header bar when attached.
+                        let show_session_header = overlay_active && !sidebar_chrome;
                         let position: Option<(usize, usize)> =
-                            if overlay_active && let Some(d) = self.dashboard.as_ref() {
+                            if show_session_header && let Some(d) = self.dashboard.as_ref() {
                                 let order = crate::views::dashboard::overlay_cycle_order(d, agents);
                                 order
                                     .iter()
@@ -4778,7 +5082,7 @@ impl AppView {
                                 None
                             };
                         let overlay_can_cycle = position.is_some_and(|(_, n)| n > 1);
-                        let (agent_area, header) = if overlay_active {
+                        let (agent_area, header) = if show_session_header {
                             let theme = crate::theme::Theme::current();
                             let title = agents
                                 .get(&id)
@@ -4797,7 +5101,7 @@ impl AppView {
                                 .unwrap_or((false, false, false));
                             let header = crate::views::dashboard::render_dashboard_session_header(
                                 f.buffer_mut(),
-                                view_area,
+                                draw_area,
                                 &theme,
                                 &title,
                                 position,
@@ -4810,10 +5114,10 @@ impl AppView {
                             );
                             match header {
                                 Some(chrome) => (chrome.content, Some(chrome)),
-                                None => (view_area, None),
+                                None => (draw_area, None),
                             }
                         } else {
-                            (view_area, None)
+                            (draw_area, None)
                         };
                         if let Some(d) = self.dashboard.as_mut() {
                             d.overlay_close_hit.set(header.and_then(|c| c.close_rect));
@@ -4846,6 +5150,8 @@ impl AppView {
                             } else {
                                 0
                             };
+                            // Sidebar chrome owns session chrome; agent draws as a normal main pane.
+                            let agent_overlay = overlay_active && !sidebar_chrome;
                             let result = agent.draw(
                                 agent_area,
                                 f.buffer_mut(),
@@ -4866,8 +5172,8 @@ impl AppView {
                                     },
                                 },
                                 &self.bundle_state,
-                                overlay_active,
-                                overlay_can_cycle,
+                                agent_overlay,
+                                overlay_can_cycle && agent_overlay,
                                 link_spans,
                                 AppRenderParams {
                                     voice_available,
@@ -4914,7 +5220,18 @@ impl AppView {
                             } else {
                                 cursor_pos
                             };
-                            return (cursor, Self::merge_escapes(notif_escapes, post_flush));
+                            let merged = Self::merge_escapes(notif_escapes, post_flush);
+                            // Dashboard modals cover the full frame (sidebar + main).
+                            if let Some(dashboard) = self.dashboard.as_mut()
+                                && crate::views::dashboard::render_dashboard_overlays(
+                                    f.buffer_mut(),
+                                    view_area,
+                                    dashboard,
+                                )
+                            {
+                                return (None, merged);
+                            }
+                            return (cursor, merged);
                         }
                     }
                     ActiveView::AgentDashboard => {

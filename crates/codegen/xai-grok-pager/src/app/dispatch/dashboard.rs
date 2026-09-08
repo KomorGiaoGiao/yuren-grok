@@ -45,7 +45,7 @@ fn dashboard_state_from_persisted(app: &mut AppView) -> crate::views::dashboard:
     DashboardState::from_persisted(&persisted, &resolver)
 }
 
-pub(super) fn ensure_dashboard_state(app: &mut AppView) {
+pub(crate) fn ensure_dashboard_state(app: &mut AppView) {
     if app.dashboard.is_some() {
         return;
     }
@@ -76,6 +76,75 @@ pub(super) fn ensure_dashboard_state(app: &mut AppView) {
         .slash_controller
         .set_usage_command_visible(usage_cmd);
     app.dashboard = Some(state);
+}
+
+/// Best-effort terminal width for sidebar-mode decisions in dispatch (no frame yet).
+fn dashboard_terminal_width(app: &AppView) -> u16 {
+    if let (Some(side), Some(main)) = (app.last_sidebar_rect, app.last_main_rect) {
+        let combined = side.width.saturating_add(main.width);
+        if combined > 0 {
+            return combined;
+        }
+    }
+    if let Some(main) = app.last_main_rect.filter(|r| r.width > 0) {
+        return main.width;
+    }
+    app.dashboard
+        .as_ref()
+        .map(|d| d.last_area.width)
+        .filter(|w| *w > 0)
+        .unwrap_or_else(|| {
+            crossterm::terminal::size()
+                .map(|(w, _)| w)
+                .unwrap_or(80)
+        })
+}
+
+/// Wide terminal + sidebar preference: Ctrl+\ toggles focus instead of fullscreen dashboard.
+fn sidebar_mode_preferred(app: &AppView) -> bool {
+    app.dashboard_sidebar_enabled
+        && crate::views::dashboard::dashboard_enabled()
+        && crate::views::dashboard::sidebar_fits(dashboard_terminal_width(app))
+}
+
+/// Mount dashboard state for the persistent sidebar without switching to `AgentDashboard`.
+/// Called from draw when auth is done so Welcome can show the sidebar without Ctrl+\ first.
+pub(crate) fn maybe_mount_sidebar_dashboard(app: &mut AppView) {
+    if app.dashboard.is_some() {
+        return;
+    }
+    if !app.dashboard_sidebar_enabled || !crate::views::dashboard::dashboard_enabled() {
+        return;
+    }
+    if !matches!(app.auth_state, crate::app::app_view::AuthState::Done) {
+        return;
+    }
+    if matches!(
+        app.consent_state,
+        crate::app::consent::ConsentState::Pending { .. }
+    ) {
+        return;
+    }
+    if matches!(app.trust_state, TrustState::Pending { .. }) {
+        return;
+    }
+    if matches!(app.active_view, ActiveView::AgentDashboard) {
+        return;
+    }
+    ensure_dashboard_state(app);
+    configure_dashboard_state(app);
+    apply_persisted_sidebar_width(app);
+}
+
+/// Apply `[dashboard].sidebar_width` from the cached persisted config onto `app`.
+pub(crate) fn apply_persisted_sidebar_width(app: &mut AppView) {
+    if let Some(w) = app
+        .dashboard_persisted
+        .as_ref()
+        .and_then(|p| p.sidebar_width)
+    {
+        app.dashboard_sidebar_width = w.max(crate::views::dashboard::SIDEBAR_WIDTH_MIN);
+    }
 }
 
 /// Configure the dashboard for display: snapshot app-wide state (cwd, models, plugins, permission mode) and clear the staged dispatch settings.
@@ -125,7 +194,11 @@ fn configure_dashboard_state(app: &mut AppView) {
 /// Open the dashboard view. Respects the [`crate::views::dashboard::dashboard_enabled`] feature flag (env var override and persisted setting).
 /// The dashboard is independent of leader mode: it renders local sessions from `app.agents`.
 /// When connected via a leader it also polls the leader roster (see the roster-poll gate in the event loop).
+///
+/// On a wide terminal with sidebar chrome enabled, Ctrl+\ toggles focus Sidebar ↔ Main without
+/// switching to fullscreen `AgentDashboard`. Narrow terminals keep the classic fullscreen toggle.
 pub(super) fn dispatch_open_dashboard(app: &mut AppView) -> Vec<Effect> {
+    use crate::app::app_view::DashboardFocusPane;
     use crate::views::dashboard::dashboard_enabled;
 
     if !dashboard_enabled() {
@@ -157,15 +230,13 @@ pub(super) fn dispatch_open_dashboard(app: &mut AppView) -> Vec<Effect> {
     if matches!(app.active_view, ActiveView::AgentDashboard) {
         return dispatch_exit_dashboard(app);
     }
-    // Stamp return target for this visit (clears any prior leftover).
-    app.dashboard_return = match app.active_view {
-        ActiveView::Agent(id) => Some(DashboardReturn::Agent(id)),
-        _ => None,
-    };
+
+    let first_mount = app.dashboard.is_none();
     // `app.dashboard.is_some()` means it was initialised before; keep the user's filter, dispatch text, hover, and selection across the reopen
     // Otherwise seed from persisted state
-    if app.dashboard.is_none() {
+    if first_mount {
         ensure_dashboard_state(app);
+        apply_persisted_sidebar_width(app);
     } else if let Some(d) = app.dashboard.as_mut() {
         // Subsequent reopen: just gc dead ids; in-memory state stays
         d.gc_stale_refs(&dashboard_alive_fn(&app.agents));
@@ -191,14 +262,43 @@ pub(super) fn dispatch_open_dashboard(app: &mut AppView) -> Vec<Effect> {
             agent.worktree_label = info.worktree_label;
         }
     }
+    configure_dashboard_state(app);
+
+    // Wide + sidebar enabled: toggle focus without leaving Welcome/Agent.
+    if sidebar_mode_preferred(app) {
+        app.dashboard_focus = match app.dashboard_focus {
+            DashboardFocusPane::Main => DashboardFocusPane::Sidebar,
+            DashboardFocusPane::Sidebar => DashboardFocusPane::Main,
+        };
+        if app.dashboard_focus == DashboardFocusPane::Sidebar
+            && let Some(d) = app.dashboard.as_mut()
+        {
+            // Sidebar has no dispatch textarea; keep list navigation keys active.
+            d.list_focused = true;
+        }
+        if !first_mount {
+            return vec![];
+        }
+        log_dashboard_opened(app);
+        return dashboard_open_fetch_effects(app);
+    }
+
+    // Stamp return target for this visit (clears any prior leftover).
+    app.dashboard_return = match app.active_view {
+        ActiveView::Agent(id) => Some(DashboardReturn::Agent(id)),
+        _ => None,
+    };
     // Open shows only the dashboard; Enter on a row switches to the agent's fullscreen view (`dispatch_dashboard_attach`)
     //
     // Always open in new-session mode: focus the `[+ New Agent]` button with no row selected, so a typed prompt dispatches a brand new agent
     // Reply is opt-in: navigating (↑/↓ or j/k) or clicking a row selects it, which arms "reply to that agent"
     // Pre-seeding `selected` used to silently arm reply, and the reply path never clears it, so every later dispatch stuck to the same agent
-    configure_dashboard_state(app);
     app.active_view = ActiveView::AgentDashboard;
     log_dashboard_opened(app);
+    dashboard_open_fetch_effects(app)
+}
+
+fn dashboard_open_fetch_effects(app: &mut AppView) -> Vec<Effect> {
     if app.workspace_dashboard_enabled {
         app.dashboard_sessions_loading = app.workspace_snapshot.is_none();
         crate::app::workspace_sync::request(app);
@@ -240,6 +340,16 @@ fn dashboard_alive_fn(
 }
 
 pub(super) fn dispatch_exit_dashboard(app: &mut AppView) -> Vec<Effect> {
+    use crate::app::app_view::DashboardFocusPane;
+
+    // Sidebar chrome mode: Ctrl+\ / exit means focus Main; keep `app.dashboard` mounted.
+    if sidebar_mode_preferred(app) && app.dashboard.is_some()
+        && !matches!(app.active_view, ActiveView::AgentDashboard)
+    {
+        app.dashboard_focus = DashboardFocusPane::Main;
+        return vec![];
+    }
+
     // Also clear any popup attachment so a fresh reopen lands on the row list, not on a stale popup (`close_popup()` clears the hit rects too.)
     if let Some(d) = app.dashboard.as_mut() {
         d.restore_peek_viewport(&mut app.agents);
@@ -335,6 +445,9 @@ pub(super) fn dispatch_dashboard_attach(
                 d.attached_agent = Some(agent_id);
             }
             app.active_view = ActiveView::Agent(agent_id);
+            if sidebar_mode_preferred(app) {
+                app.dashboard_focus = crate::app::app_view::DashboardFocusPane::Main;
+            }
             log_dashboard_attached(&DashboardRowId::TopLevel(agent_id));
             surface_yolo_launch_block_notice(app, agent_id);
         }
@@ -365,6 +478,9 @@ pub(super) fn dispatch_dashboard_attach(
                 d.attached_agent = Some(parent);
             }
             app.active_view = ActiveView::Agent(parent);
+            if sidebar_mode_preferred(app) {
+                app.dashboard_focus = crate::app::app_view::DashboardFocusPane::Main;
+            }
             log_dashboard_attached(&row_id);
             surface_yolo_launch_block_notice(app, parent);
         }
@@ -395,6 +511,9 @@ pub(super) fn dispatch_dashboard_attach(
             if let Some(existing_id) =
                 focus_if_session_already_open(app, session_id.as_str(), conversation_entry)
             {
+                if sidebar_mode_preferred(app) {
+                    app.dashboard_focus = crate::app::app_view::DashboardFocusPane::Main;
+                }
                 log_dashboard_attached(&DashboardRowId::TopLevel(existing_id));
                 return vec![];
             }
@@ -411,6 +530,9 @@ pub(super) fn dispatch_dashboard_attach(
                     d.focus_row(DashboardRowId::TopLevel(new_id));
                     d.attached_agent = Some(new_id);
                 }
+                if sidebar_mode_preferred(app) {
+                    app.dashboard_focus = crate::app::app_view::DashboardFocusPane::Main;
+                }
                 log_dashboard_attached(&DashboardRowId::TopLevel(new_id));
             }
             return effects;
@@ -422,6 +544,8 @@ pub(super) fn dispatch_dashboard_attach(
 
 /// Exit the dashboard's session-overlay: dismiss the bordered chrome and return to the dashboard view.
 pub(super) fn dispatch_dashboard_overlay_exit(app: &mut AppView) -> Vec<Effect> {
+    use crate::app::app_view::DashboardFocusPane;
+
     // Capture before close_popup() clears attached_agent.
     if let ActiveView::Agent(id) = app.active_view {
         app.dashboard_return = Some(DashboardReturn::Overlay(id));
@@ -434,6 +558,11 @@ pub(super) fn dispatch_dashboard_overlay_exit(app: &mut AppView) -> Vec<Effect> 
     // An armed stop-confirm would survive the exit and let a later Ctrl+X on the dashboard close a session with a single press
     // The confirm is bound to this overlay and this agent; clear it on the way out
     clear_pending_overlay_stop(app);
+    // Sidebar chrome: keep the agent on screen and move focus to the sidebar list.
+    if sidebar_mode_preferred(app) && app.dashboard.is_some() {
+        app.dashboard_focus = DashboardFocusPane::Sidebar;
+        return vec![];
+    }
     app.active_view = ActiveView::AgentDashboard;
     vec![]
 }
@@ -665,8 +794,16 @@ fn set_create_permission_mode(
 /// Create a new session AND switch into its detail view.
 /// Routed from the `[+ New Agent]` button, or Enter on an empty prompt while the button is focused.
 /// Mirrors `dispatch_dashboard_dispatch`'s new-session arm with `attach=true`, minus the prompt enqueue.
+///
+/// In persistent sidebar mode, asks for a working directory via the native folder
+/// dialog first (see [`dispatch_dashboard_new_via_folder_pick`]); cancel leaves
+/// the UI unchanged. Fullscreen dashboard still creates immediately.
 pub(super) fn dispatch_dashboard_create_new_agent_with_detail(app: &mut AppView) -> Vec<Effect> {
     let _ = voice_stop_on_submit(app);
+    // Sidebar chrome: pick a folder before creating so the user can choose the cwd.
+    if sidebar_mode_preferred(app) && !app.pending_create_after_folder_pick {
+        return dispatch_dashboard_new_via_folder_pick(app);
+    }
     // Worktree mode on in a git repo: open the label dialog (it spawns the agent in a fresh worktree on confirm) instead of a plain session
     // The button opens the detail view, so confirm attaches (`attach = true`)
     if app.cwd_has_git_ancestor && app.dashboard.as_ref().is_some_and(|d| d.dispatch_worktree) {
@@ -693,6 +830,9 @@ pub(super) fn dispatch_dashboard_create_new_agent_with_detail(app: &mut AppView)
         d.attached_agent = Some(new_id);
     }
     app.active_view = ActiveView::Agent(new_id);
+    if sidebar_mode_preferred(app) {
+        app.dashboard_focus = crate::app::app_view::DashboardFocusPane::Main;
+    }
     sync_active_permission_mode_mirror(app);
     surface_yolo_launch_block_notice(app, new_id);
     effects
@@ -762,16 +902,23 @@ pub(super) fn resolve_location_input(
     }
 }
 
+/// True when location / Browse / cwd changes are allowed: fullscreen dashboard
+/// **or** the persistent sidebar chrome (dashboard state mounted beside Welcome/Agent).
+fn dashboard_location_surface_active(app: &AppView) -> bool {
+    matches!(app.active_view, ActiveView::AgentDashboard)
+        || (app.dashboard.is_some()
+            && app.dashboard_sidebar_enabled
+            && crate::views::dashboard::dashboard_enabled())
+}
+
 /// Open the dashboard's location picker.
 /// Seeds the candidate list with the current cwd (marked `(current)`) followed by recent project directories from session history.
 /// Idempotent: a no-op if the picker is already open or the dashboard isn't active.
 pub(super) fn dispatch_dashboard_open_location_picker(app: &mut AppView) -> Vec<Effect> {
     use crate::views::dashboard::{LocationCandidate, LocationPickerState};
 
-    if !matches!(app.active_view, ActiveView::AgentDashboard) {
+    if !dashboard_location_surface_active(app) {
         // `/cd` reached from a non-dashboard surface; the location picker is a dashboard affordance, so guide the user there
-        // Gate on the dashboard being the foreground view
-        // `app.dashboard.is_some()` stays true for the rest of the session once the dashboard has been opened even once
         app.show_toast("Open the dashboard (/dashboard) to change location");
         return vec![];
     }
@@ -786,9 +933,13 @@ pub(super) fn dispatch_dashboard_open_location_picker(app: &mut AppView) -> Vec<
 
     let cwd = app.cwd.clone();
     // The recent-dirs source is async; block the current runtime thread briefly to collect it.
-    let recent = tokio::task::block_in_place(|| {
-        tokio::runtime::Handle::current().block_on(crate::recent_dirs::collect_recent_dirs(10))
-    });
+    // Outside a Tokio runtime (some unit tests) skip recents rather than panic.
+    let recent = match tokio::runtime::Handle::try_current() {
+        Ok(handle) => tokio::task::block_in_place(|| {
+            handle.block_on(crate::recent_dirs::collect_recent_dirs(10))
+        }),
+        Err(_) => Vec::new(),
+    };
 
     // Worktree label index keyed by root path, built once and reused to tag both recents and live directory suggestions
     let worktrees = crate::git_info::worktree_label_index();
@@ -834,10 +985,8 @@ pub(super) fn dispatch_dashboard_open_location_picker(app: &mut AppView) -> Vec<
 /// Resolves and validates the path; on success updates `app.cwd` and the process cwd (so newly dispatched sessions spawn there) and closes the modal.
 /// On failure the modal stays open with an inline error and the cwd is unchanged.
 pub(super) fn dispatch_dashboard_change_location(app: &mut AppView, input: String) -> Vec<Effect> {
-    // Gate on the dashboard being the foreground view
-    // `/cd <path>` typed from another surface (welcome, an agent session, the dashboard overlay) would otherwise silently change the process cwd
-    // `app.dashboard` stays `Some` for the rest of the session once opened.
-    if !matches!(app.active_view, ActiveView::AgentDashboard) {
+    // Gate on fullscreen dashboard or persistent sidebar chrome (not a bare agent with no sidebar).
+    if !dashboard_location_surface_active(app) {
         app.show_toast("Open the dashboard (/dashboard) to change location");
         return vec![];
     }
@@ -898,6 +1047,52 @@ pub(super) fn dispatch_dashboard_change_location(app: &mut AppView, input: Strin
     // Change the process cwd via an effect, not inline, so the reducer stays side-effect free
     // Parallel tests would otherwise leak the process cwd into each other
     vec![Effect::SetWorkingDir { path }]
+}
+
+/// Arm a native OS folder dialog for choosing the dashboard working directory.
+///
+/// The event loop suspends the TUI, runs [`crate::native_folder_dialog::pick_folder`], then applies
+/// the result through [`dispatch_dashboard_change_location`]. Opens the location picker first when
+/// it is not already visible, so cancel leaves the user on the familiar modal.
+pub(super) fn dispatch_dashboard_browse_native_location(app: &mut AppView) -> Vec<Effect> {
+    if !dashboard_location_surface_active(app) {
+        app.show_toast("Open the dashboard (/dashboard) to change location");
+        return vec![];
+    }
+    // Ensure the location picker is open so cancel returns to it (fullscreen / sidebar chrome).
+    let picker_open = app
+        .dashboard
+        .as_ref()
+        .is_some_and(|d| d.location_picker.is_some());
+    if !picker_open {
+        let _ = dispatch_dashboard_open_location_picker(app);
+    }
+    let initial = app
+        .dashboard
+        .as_ref()
+        .map(|d| d.cwd.clone())
+        .unwrap_or_else(|| app.cwd.clone());
+    app.pending_folder_picker = Some(initial);
+    crate::unified_log::info("dashboard.location_picker.browse_native", None, None);
+    vec![]
+}
+
+/// Sidebar `[+ New]`: open the native folder dialog first; on pick, change cwd and create.
+/// Fullscreen dashboard keeps the old immediate-create path (header already shows location).
+pub(super) fn dispatch_dashboard_new_via_folder_pick(app: &mut AppView) -> Vec<Effect> {
+    if !dashboard_location_surface_active(app) {
+        ensure_dashboard_state(app);
+        configure_dashboard_state(app);
+    }
+    let initial = app
+        .dashboard
+        .as_ref()
+        .map(|d| d.cwd.clone())
+        .unwrap_or_else(|| app.cwd.clone());
+    app.pending_create_after_folder_pick = true;
+    app.pending_folder_picker = Some(initial);
+    crate::unified_log::info("dashboard.new_via_folder_pick", None, None);
+    vec![]
 }
 
 /// Confirm the dashboard worktree-label dialog: create the agent in a fresh worktree at `app.cwd`, replaying any prompt stashed at dialog open.
@@ -2201,7 +2396,7 @@ pub(super) fn dispatch_dashboard_reorder(app: &mut AppView, up: bool) -> Vec<Eff
     dispatch_dashboard_persist(app)
 }
 
-fn dispatch_dashboard_persist(app: &mut AppView) -> Vec<Effect> {
+pub(crate) fn dispatch_dashboard_persist(app: &mut AppView) -> Vec<Effect> {
     let Some(d) = app.dashboard.as_ref() else {
         return vec![];
     };
@@ -2213,7 +2408,8 @@ fn dispatch_dashboard_persist(app: &mut AppView) -> Vec<Effect> {
         .map(|p| p.enabled)
         .unwrap_or(true);
     let resolver = crate::views::dashboard::SessionIdResolver::from_agents(&app.agents);
-    let persisted = d.to_persisted(enabled, &resolver);
+    let sidebar_width = Some(app.dashboard_sidebar_width);
+    let persisted = d.to_persisted_with_sidebar_width(enabled, &resolver, sidebar_width);
     app.dashboard_persisted = Some(persisted.clone());
     vec![Effect::PersistDashboard(persisted)]
 }

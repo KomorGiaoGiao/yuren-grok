@@ -404,6 +404,29 @@ pub fn render_dashboard(
         pending_hint,
     );
 
+    // Modals paint last over the full frame (sidebar + main when chrome is split).
+    if render_dashboard_overlays(buf, area, state) {
+        return None;
+    }
+
+    // An active rename replaces the dispatch caret with its row-local editor caret.
+    if let Some(pos) = rename_cursor_pos(state, &rows) {
+        return Some(pos);
+    }
+    dispatch_cursor
+}
+
+/// Paint shortcuts / location-picker / worktree overlays over `area`.
+///
+/// Returns `true` when a modal is open and consumed the cursor (caller should
+/// return `None` for the frame caret). Safe to call with the full frame so
+/// modals cover both sidebar and main panes.
+pub fn render_dashboard_overlays(
+    buf: &mut Buffer,
+    area: Rect,
+    state: &mut DashboardState,
+) -> bool {
+    let theme = Theme::current();
     // Cheatsheet modal paints LAST so it overlays everything: the row list, the dispatch widget, the footer hints
     // The modal lives on `DashboardState` (mirrors `agent_view`'s `active_modal`)
     // When None, nothing paints and the regular cursor logic below proceeds
@@ -422,28 +445,24 @@ pub fn render_dashboard(
             &theme,
             /* compact */ false,
         );
-        return None;
+        return true;
     }
 
     // The location picker overlays everything too (mutually exclusive with the shortcuts modal in practice)
     // When open, input is routed to it, so the dispatch cursor is suppressed
     if let Some(modal) = state.location_picker.as_mut() {
         render_location_picker(buf, area, &theme, modal);
-        return None;
+        return true;
     }
 
     // The worktree-label dialog overlays the dashboard while the user names the worktree for a dashboard-dispatched agent
     // Input is routed to it, so the dispatch cursor is suppressed
     if let Some(dialog) = state.worktree_dialog.as_ref() {
         crate::views::new_worktree_dialog::render_new_worktree_dialog(area, buf, dialog);
-        return None;
+        return true;
     }
 
-    // An active rename replaces the dispatch caret with its row-local editor caret.
-    if let Some(pos) = rename_cursor_pos(state, &rows) {
-        return Some(pos);
-    }
-    dispatch_cursor
+    false
 }
 
 const RENAME_PREFIX: &str = "rename: ";
@@ -941,6 +960,11 @@ fn render_location_picker(
             label: "Enter select",
             clickable: false,
             id: 2,
+        },
+        Shortcut {
+            label: "Browse\u{2026}",
+            clickable: true,
+            id: super::state::LOCATION_PICKER_BROWSE_SHORTCUT,
         },
         Shortcut {
             label: "Esc close",

@@ -9,7 +9,8 @@ use super::ctx::{
     sync_sleep_inhibitor, with_active_agent, with_scrollback,
 };
 use super::dashboard::{
-    dispatch_dashboard_attach, dispatch_dashboard_begin_rename, dispatch_dashboard_change_location,
+    dispatch_dashboard_attach, dispatch_dashboard_begin_rename,
+    dispatch_dashboard_browse_native_location, dispatch_dashboard_change_location,
     dispatch_dashboard_commit_rename, dispatch_dashboard_confirm_worktree,
     dispatch_dashboard_create_new_agent_with_detail, dispatch_dashboard_delete,
     dispatch_dashboard_dispatch, dispatch_dashboard_dispatch_slash,
@@ -1432,6 +1433,7 @@ pub(crate) fn dispatch(action: Action, app: &mut AppView) -> Vec<Effect> {
             vec![]
         }
         Action::DashboardChangeLocation { input } => dispatch_dashboard_change_location(app, input),
+        Action::DashboardBrowseNativeLocation => dispatch_dashboard_browse_native_location(app),
         Action::DashboardConfirmWorktree { label } => {
             dispatch_dashboard_confirm_worktree(app, label)
         }

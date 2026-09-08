@@ -357,6 +357,8 @@ pub struct PersistedDashboard {
     pub grouping: Grouping,
     pub pinned: BTreeSet<PersistedRowId>,
     pub reorder: Vec<PersistedRowId>,
+    /// User-dragged left sidebar width in columns (`None` = use default).
+    pub sidebar_width: Option<u16>,
 }
 
 impl PersistedDashboard {
@@ -367,6 +369,7 @@ impl PersistedDashboard {
             grouping: Grouping::default(),
             pinned: BTreeSet::new(),
             reorder: Vec::new(),
+            sidebar_width: None,
         }
     }
 }
@@ -737,6 +740,9 @@ pub struct LocationCandidate {
 /// Max directory entries listed per parent (bounds the cost of a `readdir` on a huge directory) and max rows shown to the picker.
 const LOCATION_DIR_LISTING_CAP: usize = 1000;
 const LOCATION_VISIBLE_CAP: usize = 200;
+
+/// Footer shortcut id for the location picker's native **Browse…** action.
+pub const LOCATION_PICKER_BROWSE_SHORTCUT: usize = 10;
 
 /// State for the dashboard's location picker modal (change the directory new sessions spawn in).
 ///
@@ -1515,6 +1521,16 @@ impl DashboardState {
     /// Top-level rows whose underlying agent does not yet have a `session_id` are dropped (they can't be persisted yet; but they'll remain in the
     /// in-memory state for the rest of this process lifetime).
     pub fn to_persisted(&self, enabled: bool, resolver: &SessionIdResolver) -> PersistedDashboard {
+        self.to_persisted_with_sidebar_width(enabled, resolver, None)
+    }
+
+    /// Snapshot including an explicit sidebar width (from AppView drag state).
+    pub fn to_persisted_with_sidebar_width(
+        &self,
+        enabled: bool,
+        resolver: &SessionIdResolver,
+        sidebar_width: Option<u16>,
+    ) -> PersistedDashboard {
         PersistedDashboard {
             enabled,
             grouping: self.grouping,
@@ -1528,6 +1544,7 @@ impl DashboardState {
                 .iter()
                 .filter_map(|id| resolver.to_persisted(id))
                 .collect(),
+            sidebar_width,
         }
     }
 
@@ -3706,6 +3723,15 @@ impl DashboardState {
             };
         }
 
+        // Ctrl+B opens the native OS folder dialog (same as the Browse… footer shortcut)
+        if let Event::Key(key) = ev
+            && key.kind != KeyEventKind::Release
+            && key.code == KeyCode::Char('b')
+            && key.modifiers == KeyModifiers::CONTROL
+        {
+            return InputOutcome::Action(Action::DashboardBrowseNativeLocation);
+        }
+
         // Tab does shell-style completion: fill the input with the selected row's path (tilde-collapsed)
         // plus a trailing `/` so the next listing drills into it
         // No-op when nothing is selected
@@ -3768,6 +3794,11 @@ impl DashboardState {
         match handle_modal_mouse(&mut lp.window, mouse.kind, mouse.column, mouse.row) {
             ModalWindowOutcome::CloseRequested => {
                 return InputOutcome::Action(Action::DashboardCloseLocationPicker);
+            }
+            ModalWindowOutcome::ShortcutActivated(id)
+                if id == LOCATION_PICKER_BROWSE_SHORTCUT =>
+            {
+                return InputOutcome::Action(Action::DashboardBrowseNativeLocation);
             }
             ModalWindowOutcome::Handled => return InputOutcome::Changed,
             _ => {}
@@ -4312,11 +4343,17 @@ pub fn load_persisted_from_path(path: &std::path::Path) -> Option<PersistedDashb
         Some(item) => parse_persist_key_list(item),
         None => Vec::new(),
     };
+    let sidebar_width = table
+        .get("sidebar_width")
+        .and_then(|v| v.as_integer())
+        .and_then(|n| u16::try_from(n).ok())
+        .filter(|&w| w > 0);
     Some(PersistedDashboard {
         enabled,
         grouping,
         pinned,
         reorder,
+        sidebar_width,
     })
 }
 
@@ -4374,6 +4411,12 @@ pub fn write_persisted_to_path(
         reorder_arr.push(id.to_key());
     }
     t["reorder"] = toml_edit::value(reorder_arr);
+    match p.sidebar_width {
+        Some(w) => t["sidebar_width"] = toml_edit::value(i64::from(w)),
+        None => {
+            t.remove("sidebar_width");
+        }
+    }
     // The onboarding hint was removed; drop the stale table so old configs don't carry a dead `[dashboard.onboarding]` key forever
     t.remove("onboarding");
     atomic_write(path, doc.to_string().as_bytes())

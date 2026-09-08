@@ -34,6 +34,7 @@ pub mod minimal_api;
 #[path = "minimal/hook.rs"]
 pub mod minimal_hook;
 pub mod models;
+pub mod native_folder_dialog;
 pub mod notifications;
 #[allow(unused_imports, unused_macros)]
 pub mod obf;

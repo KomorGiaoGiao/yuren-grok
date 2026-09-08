@@ -485,6 +485,186 @@ fn compute_layout_with_dispatch_inner(
     }
 }
 
+/// Default width of the persistent left dashboard sidebar (cols).
+pub const SIDEBAR_WIDTH: u16 = 32;
+
+/// Alias kept for call sites that want the explicit "default" name.
+pub const SIDEBAR_WIDTH_DEFAULT: u16 = SIDEBAR_WIDTH;
+
+/// Narrowest usable sidebar (cols). Below this, labels are unreadable.
+pub const SIDEBAR_WIDTH_MIN: u16 = 20;
+
+/// Widest sidebar the user can drag to (cols). Still clamped by remaining main space.
+pub const SIDEBAR_WIDTH_MAX: u16 = 64;
+
+/// Vertical resize handle between sidebar and main (cols).
+pub const SIDEBAR_DIVIDER_COLS: u16 = 1;
+
+/// Minimum width the main pane must keep when the sidebar is shown.
+pub const SIDEBAR_MIN_MAIN: u16 = 48;
+
+/// Whether `total_width` can host min sidebar + divider + a usable main pane.
+pub fn sidebar_fits(total_width: u16) -> bool {
+    total_width
+        >= SIDEBAR_WIDTH_MIN
+            .saturating_add(SIDEBAR_DIVIDER_COLS)
+            .saturating_add(SIDEBAR_MIN_MAIN)
+}
+
+/// Clamp a desired sidebar width for the given total frame width.
+pub fn clamp_sidebar_width(desired: u16, total_width: u16) -> u16 {
+    if !sidebar_fits(total_width) {
+        return SIDEBAR_WIDTH_MIN;
+    }
+    let max_for_frame = total_width
+        .saturating_sub(SIDEBAR_DIVIDER_COLS.saturating_add(SIDEBAR_MIN_MAIN))
+        .min(SIDEBAR_WIDTH_MAX)
+        .max(SIDEBAR_WIDTH_MIN);
+    desired.clamp(SIDEBAR_WIDTH_MIN, max_for_frame)
+}
+
+/// Split `area` into `(sidebar, divider, main)` when [`sidebar_fits`]; otherwise `None`.
+///
+/// `desired_width` is clamped via [`clamp_sidebar_width`]. The divider is a 1-col
+/// drag handle between the panes.
+pub fn split_sidebar_main(area: Rect, desired_width: u16) -> Option<(Rect, Rect, Rect)> {
+    if !sidebar_fits(area.width) {
+        return None;
+    }
+    let side_w = clamp_sidebar_width(desired_width, area.width);
+    let sidebar = Rect {
+        x: area.x,
+        y: area.y,
+        width: side_w,
+        height: area.height,
+    };
+    let divider = Rect {
+        x: area.x.saturating_add(side_w),
+        y: area.y,
+        width: SIDEBAR_DIVIDER_COLS,
+        height: area.height,
+    };
+    let main_x = divider.x.saturating_add(divider.width);
+    let main = Rect {
+        x: main_x,
+        y: area.y,
+        width: area.width.saturating_sub(side_w.saturating_add(SIDEBAR_DIVIDER_COLS)),
+        height: area.height,
+    };
+    Some((sidebar, divider, main))
+}
+
+/// Paint the 1-col resize handle between sidebar and main.
+///
+/// Hovered / dragging: brighter bar on a highlight background so the grip is obvious.
+pub fn render_sidebar_divider(
+    buf: &mut ratatui::buffer::Buffer,
+    area: Rect,
+    theme: &crate::theme::Theme,
+    hovered: bool,
+    dragging: bool,
+) {
+    if area.area() == 0 {
+        return;
+    }
+    let active = hovered || dragging;
+    let bg = if active {
+        theme.bg_hover
+    } else {
+        theme.bg_base
+    };
+    let fg = if dragging {
+        theme.accent_user
+    } else if hovered {
+        theme.text_primary
+    } else {
+        theme.gray_dim
+    };
+    let glyph = if active { "┃" } else { "│" };
+    let style = ratatui::style::Style::default().fg(fg).bg(bg);
+    for y in area.y..area.y.saturating_add(area.height) {
+        buf.set_string(area.x, y, glyph, style);
+    }
+}
+
+/// Vertical band layout inside the left sidebar pane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SidebarLayout {
+    /// Cwd / location row at the top. Height: 0 or 1.
+    pub location: Rect,
+    /// `[+ New]` button row under the location. Height: 0 or 1.
+    pub new_button: Rect,
+    /// Compact session list filling the remainder.
+    pub list: Rect,
+    /// Optional footer hint row at the bottom. Height: 0 or 1.
+    pub footer: Rect,
+}
+
+/// Compute the sidebar's vertical bands for a given sidebar pane rect.
+///
+/// Order top→bottom: location, new-button, list, footer.
+/// Location / button / footer collapse to height 0 on short panes so the list keeps space.
+pub fn compute_sidebar_layout(area: Rect) -> SidebarLayout {
+    if area.height == 0 || area.width == 0 {
+        let z = Rect {
+            x: area.x,
+            y: area.y,
+            width: area.width,
+            height: 0,
+        };
+        return SidebarLayout {
+            location: z,
+            new_button: z,
+            list: z,
+            footer: z,
+        };
+    }
+
+    // Prefer keeping the list visible: drop footer first, then button, then location.
+    let location_h: u16 = if area.height >= 1 { 1 } else { 0 };
+    let button_h: u16 = if area.height >= 2 { 1 } else { 0 };
+    let footer_h: u16 = if area.height >= 4 { 1 } else { 0 };
+    let list_h = area
+        .height
+        .saturating_sub(location_h + button_h + footer_h);
+
+    let mut y = area.y;
+    let location = Rect {
+        x: area.x,
+        y,
+        width: area.width,
+        height: location_h,
+    };
+    y += location_h;
+    let new_button = Rect {
+        x: area.x,
+        y,
+        width: area.width,
+        height: button_h,
+    };
+    y += button_h;
+    let list = Rect {
+        x: area.x,
+        y,
+        width: area.width,
+        height: list_h,
+    };
+    y += list_h;
+    let footer = Rect {
+        x: area.x,
+        y,
+        width: area.width,
+        height: footer_h,
+    };
+
+    SidebarLayout {
+        location,
+        new_button,
+        list,
+        footer,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -965,5 +1145,110 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn sidebar_fits_at_min_frame() {
+        let min = SIDEBAR_WIDTH_MIN + SIDEBAR_DIVIDER_COLS + SIDEBAR_MIN_MAIN;
+        assert!(sidebar_fits(min));
+        assert!(!sidebar_fits(min - 1));
+    }
+
+    #[test]
+    fn split_sidebar_main_none_when_too_narrow() {
+        let min = SIDEBAR_WIDTH_MIN + SIDEBAR_DIVIDER_COLS + SIDEBAR_MIN_MAIN;
+        let area = Rect::new(0, 0, min - 1, 24);
+        assert!(split_sidebar_main(area, SIDEBAR_WIDTH).is_none());
+    }
+
+    #[test]
+    fn split_sidebar_main_splits_at_desired_width() {
+        let area = Rect::new(2, 3, 100, 40);
+        let (sidebar, divider, main) =
+            split_sidebar_main(area, SIDEBAR_WIDTH).expect("100 fits");
+        assert_eq!(sidebar.x, 2);
+        assert_eq!(sidebar.y, 3);
+        assert_eq!(sidebar.width, SIDEBAR_WIDTH);
+        assert_eq!(sidebar.height, 40);
+        assert_eq!(divider.x, 2 + SIDEBAR_WIDTH);
+        assert_eq!(divider.width, SIDEBAR_DIVIDER_COLS);
+        assert_eq!(main.x, divider.x + divider.width);
+        assert_eq!(main.y, 3);
+        assert_eq!(
+            main.width,
+            100 - SIDEBAR_WIDTH - SIDEBAR_DIVIDER_COLS
+        );
+        assert_eq!(main.height, 40);
+        assert_eq!(
+            sidebar.width + divider.width + main.width,
+            area.width
+        );
+    }
+
+    #[test]
+    fn clamp_sidebar_width_respects_min_max_and_frame() {
+        assert_eq!(clamp_sidebar_width(10, 100), SIDEBAR_WIDTH_MIN);
+        assert_eq!(clamp_sidebar_width(200, 100), 100 - SIDEBAR_DIVIDER_COLS - SIDEBAR_MIN_MAIN);
+        assert_eq!(clamp_sidebar_width(40, 100), 40);
+    }
+
+    #[test]
+    fn compute_sidebar_layout_tiles_area() {
+        let area = Rect::new(0, 0, SIDEBAR_WIDTH, 30);
+        let layout = compute_sidebar_layout(area);
+        assert_eq!(layout.location.height, 1);
+        assert_eq!(layout.new_button.height, 1);
+        assert_eq!(layout.footer.height, 1);
+        assert_eq!(
+            layout.location.height
+                + layout.new_button.height
+                + layout.list.height
+                + layout.footer.height,
+            area.height
+        );
+        assert_eq!(layout.location.y, area.y);
+        assert_eq!(
+            layout.new_button.y,
+            layout.location.y + layout.location.height
+        );
+        assert_eq!(
+            layout.list.y,
+            layout.new_button.y + layout.new_button.height
+        );
+        assert_eq!(layout.footer.y, layout.list.y + layout.list.height);
+        assert_eq!(
+            layout.footer.y + layout.footer.height,
+            area.y + area.height
+        );
+    }
+
+    #[test]
+    fn compute_sidebar_layout_collapses_on_short_height() {
+        let one = compute_sidebar_layout(Rect::new(0, 0, SIDEBAR_WIDTH, 1));
+        assert_eq!(one.location.height, 1);
+        assert_eq!(one.new_button.height, 0);
+        assert_eq!(one.list.height, 0);
+        assert_eq!(one.footer.height, 0);
+
+        let two = compute_sidebar_layout(Rect::new(0, 0, SIDEBAR_WIDTH, 2));
+        assert_eq!(two.location.height, 1);
+        assert_eq!(two.new_button.height, 1);
+        assert_eq!(two.list.height, 0);
+        assert_eq!(two.footer.height, 0);
+
+        let three = compute_sidebar_layout(Rect::new(0, 0, SIDEBAR_WIDTH, 3));
+        assert_eq!(three.location.height, 1);
+        assert_eq!(three.new_button.height, 1);
+        assert_eq!(three.list.height, 1);
+        assert_eq!(three.footer.height, 0);
+    }
+
+    #[test]
+    fn compute_sidebar_layout_zero_area() {
+        let layout = compute_sidebar_layout(Rect::new(0, 0, SIDEBAR_WIDTH, 0));
+        assert_eq!(layout.location.height, 0);
+        assert_eq!(layout.new_button.height, 0);
+        assert_eq!(layout.list.height, 0);
+        assert_eq!(layout.footer.height, 0);
     }
 }

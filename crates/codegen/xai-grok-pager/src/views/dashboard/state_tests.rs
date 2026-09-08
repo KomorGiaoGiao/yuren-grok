@@ -388,6 +388,7 @@ fn persisted_on_disk_round_trip() {
         grouping: Grouping::Directory,
         pinned: pinned.clone(),
         reorder: reorder.clone(),
+        sidebar_width: Some(40),
     };
     write_persisted_to_path(&path, &p).unwrap();
     let loaded = load_persisted_from_path(&path).expect("must load back");
@@ -395,6 +396,7 @@ fn persisted_on_disk_round_trip() {
     assert_eq!(loaded.grouping, Grouping::Directory);
     assert_eq!(loaded.pinned, pinned);
     assert_eq!(loaded.reorder, reorder);
+    assert_eq!(loaded.sidebar_width, Some(40));
 }
 
 /// The onboarding hint was removed — a stale `[dashboard.onboarding]`
@@ -432,6 +434,7 @@ fn persisted_write_preserves_other_tables() {
         grouping: Grouping::State,
         pinned: BTreeSet::new(),
         reorder: Vec::new(),
+        sidebar_width: None,
     };
     write_persisted_to_path(&path, &p).unwrap();
     let after = std::fs::read_to_string(&path).unwrap();
@@ -467,6 +470,7 @@ fn persisted_write_refuses_unparseable_file() {
         grouping: Grouping::Directory,
         pinned: BTreeSet::new(),
         reorder: Vec::new(),
+        sidebar_width: None,
     };
     // write_persisted_to_path returns Ok(()) but does NOT overwrite.
     write_persisted_to_path(&path, &p).unwrap();

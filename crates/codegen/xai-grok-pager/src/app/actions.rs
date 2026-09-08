@@ -852,6 +852,11 @@ pub enum Action {
     DashboardChangeLocation {
         input: String,
     },
+    /// Open a native OS folder dialog to choose the working directory for new dashboard agents.
+    /// The dispatcher arms [`crate::app::app_view::AppView::pending_folder_picker`]; the event loop
+    /// suspends the TUI, runs the dialog, then applies [`Self::DashboardChangeLocation`] on success.
+    /// Routed from the location picker's **Browse…** footer shortcut (and Ctrl+B while that modal is open).
+    DashboardBrowseNativeLocation,
     /// Confirm the dashboard worktree-label dialog: create the next dashboard agent in a fresh git worktree rooted at `app.cwd`.
     /// `label` names the worktree; `None` auto-generates one.
     /// Any prompt stashed when the dialog opened (a prompt-send) is replayed into the new agent.

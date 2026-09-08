@@ -17,7 +17,17 @@ disk), or the workflows run UI (`/workflow runs`).
 - **`grok dashboard`** — launch the TUI into the dashboard.
 - **`/dashboard`** (aliases **`/agents-dashboard`**, **`/sessions`**) — open
   from inside a session.
-- **`Ctrl+\`** — same view as the slash command.
+- **`Ctrl+\`** — focus the dashboard (see layout below).
+
+**Wide terminals:** a persistent left sidebar shows the cwd, `[+ New]`, and
+the session list beside Welcome or the active agent. Drag the vertical
+divider between the panes to resize the sidebar (width is saved to
+`~/.grok/config.toml`). Hover highlights the divider, session rows, the
+location label, and `[+ New]`. `Ctrl+\` toggles keyboard focus between the
+sidebar and the main pane.
+
+**Narrow terminals:** the classic fullscreen dashboard view; `Ctrl+\` toggles
+it open and closed.
 
 Hidden in minimal mode. Set `GROK_AGENT_DASHBOARD=0` or
 `[dashboard].enabled = false` to disable.
@@ -25,6 +35,25 @@ Hidden in minimal mode. Set `GROK_AGENT_DASHBOARD=0` or
 ---
 
 ## What you see
+
+**Wide terminal (sidebar):**
+
+```
+┌ ~/proj          ┬──────────────────────────────────────────────┐
+│ [+ New]         │  Welcome / agent transcript                  │
+│ ▌● reviewer     │                                              │
+│  ● implementer  │                                              │
+│  ○ housekeeping │                                              │
+└─────────────────┴──────────────────────────────────────────────┘
+```
+
+Click a session (or press Enter) to open it on the right. **`[+ New…]`**
+opens the macOS folder dialog first — pick a directory, then a new session
+is created there (cancel leaves everything unchanged). You can also change
+the working directory anytime from the cwd row (`Ctrl+L` / Browse…). Peek,
+reply, and permissions stay in the main pane.
+
+**Narrow terminal (fullscreen roster):**
 
 ```
  Grok Build · Dashboard — 4 agents · 2 awaiting
@@ -93,7 +122,7 @@ The dispatch input uses the same prompt chrome as the agent view. Press
 | Hover + click `[✗]` | Permanently delete an idle/done row (click again to confirm) |
 | `Shift+↑` / `Shift+↓` | Reorder pinned rows |
 | `Esc` | Step back: cancel search → close peek → clear filter → unfocus dispatch → unselect row → exit. Never clears a typed dispatch draft (`Ctrl+U` / `Ctrl+C` for that) |
-| `Ctrl+\` | Return from details view, or exit dashboard |
+| `Ctrl+\` | Wide: toggle sidebar ↔ main focus. Narrow: return from details / exit fullscreen dashboard |
 | `Ctrl+.` (alt: `?`) | Keyboard shortcuts cheatsheet. Footer shows `?` when `Ctrl+.` cannot be delivered. Bare `?` opens help when list-focused or the draft is empty |
 
 When grouping by state, each group has a **section title** (for example
@@ -140,6 +169,22 @@ There is **no** “mark completed” command. Row state is derived from the agen
 
 There is no manual complete flag. Use `/exit` to leave a session without
 deleting history.
+
+---
+
+## Working directory (location picker)
+
+New agents spawn in the dashboard's working directory. Change it with:
+
+- **`Ctrl+L`** — open the location picker
+- **`/cd`** — same picker; `/cd ~/proj` jumps straight to a path
+- **Browse…** (in the picker footer) or **`Ctrl+B`** while the picker is open —
+  opens the **native OS folder dialog** so you can click a directory instead of
+  typing a path
+
+The picker also lists recent project folders; click a row or press Enter to
+select. Typing a path (`/`, `~`, or anything with `/`) switches to directory
+completion.
 
 ---
 
