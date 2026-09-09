@@ -100,7 +100,7 @@ fn open_path(path: String) -> Result<(), String> {
 
 #[tauri::command]
 fn login_browser(app: AppHandle) -> Result<String, String> {
-    let grok = paths::find_grok_binary(&app).ok_or("Grok CLI not found")?;
+    let grok = paths::find_grok_binary(&app).ok_or("Grok engine not found")?;
     std::process::Command::new(grok)
         .args(["login", "--oauth"])
         .spawn()
@@ -110,7 +110,7 @@ fn login_browser(app: AppHandle) -> Result<String, String> {
 
 #[tauri::command]
 fn logout_browser(app: AppHandle) -> Result<(), String> {
-    let grok = paths::find_grok_binary(&app).ok_or("Grok CLI not found")?;
+    let grok = paths::find_grok_binary(&app).ok_or("Grok engine not found")?;
     let status = std::process::Command::new(grok)
         .arg("logout")
         .status()

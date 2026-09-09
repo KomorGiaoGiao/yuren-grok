@@ -1,12 +1,10 @@
 # Grok Desktop
 
-Desktop app for the Grok coding agent — same idea as Codex Desktop / Claude Code Desktop.
-
-The window is a GUI. The work is still done by the Grok CLI over ACP (`grok agent stdio`). Sessions, skills, and plugins stay in `~/.grok`.
+Desktop app for the Grok coding agent. The window is a GUI. The engine is the bundled Grok binary, spoken to over ACP (`grok agent stdio`). Sessions, skills, plugins, and login stay in `~/.grok`.
 
 ## Run (development)
 
-Needs Node 24+, Rust, and a Grok CLI (`~/.grok/bin/grok` is fine).
+Needs Node 24+, Rust, and a Grok CLI once so the sidecar can be copied (`~/.grok/bin/grok` is fine). After that, `tauri dev` / `tauri build` copy it automatically.
 
 ```bash
 cd project
@@ -21,15 +19,9 @@ npm run tauri dev
 3. Start a session and ask Grok to look around.
 4. When it wants to edit a file or run a command, choose **Allow once**, **Always allow**, or **Reject**.
 
-## Bundle Grok into the installer
+## Packaging
 
-The Grok binary is large (~127MB) and is not committed. Before `npm run tauri build`:
-
-```bash
-./scripts/bundle-grok.sh
-```
-
-Then add `"externalBin": ["binaries/grok"]` under `src-tauri/tauri.conf.json` → `bundle`.
+`npm run tauri build` runs `scripts/bundle-grok.sh` first. The Grok binary is large (~127MB) and is not committed (`src-tauri/binaries/`). The packaged app prefers its own sidecar over a separately installed CLI.
 
 ## Layout
 

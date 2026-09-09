@@ -112,7 +112,10 @@ test('normal rejection sends reject option', async ({ page }) => {
 test('reject must not fall back to allow when rejection option is absent', async ({ page }) => {
   await boot(page); await permission(page, [{ optionId: 'yes', kind: 'allow_once' }]);
   await page.getByRole('button', { name: '拒绝', exact: true }).click();
-  expect((await calls(page, 'respond_permission')).some((c: any) => c.args.optionId === 'yes')).toBeFalsy();
+  const replies = await calls(page, 'respond_permission');
+  expect(replies).toHaveLength(1);
+  expect(replies[0].args.optionId).toBe('');
+  expect(replies.some((c: any) => c.args.optionId === 'yes')).toBeFalsy();
 });
 test('permission dialog has accessible dialog semantics and initial focus', async ({ page }) => {
   await boot(page); await permission(page, [{ optionId: 'yes', kind: 'allow_once' }, { optionId: 'no', kind: 'reject_once' }]);
@@ -124,10 +127,38 @@ test('starting new conversation clears pending permission', async ({ page }) => 
   // Programmatic click intentionally tests lifecycle cleanup beneath an overlay.
   await page.getByTestId('nav-new').dispatchEvent('click');
   await expect(page.getByText('AUDIT permission')).toHaveCount(0);
+  const replies = await calls(page, 'respond_permission');
+  expect(replies.some((c: any) => c.args.rpcId === 99 && c.args.optionId === '')).toBeTruthy();
 });
 test('settings save failure is visible to the user', async ({ page }) => {
   await boot(page, 'settings-error'); await page.getByTestId('nav-settings').click(); await page.getByRole('button', { name: '保存', exact: true }).click();
-  await expect(page.getByTestId('main')).toContainText('disk is read-only');
+  await expect(page.getByTestId('settings-save')).toContainText('disk is read-only');
+});
+test('settings save success is visible', async ({ page }) => {
+  await boot(page); await page.getByTestId('nav-settings').click();
+  await page.getByRole('button', { name: '保存', exact: true }).click();
+  await expect(page.getByTestId('settings-save')).toContainText('已保存');
+});
+test('settings login starts browser oauth', async ({ page }) => {
+  await boot(page); await page.getByTestId('nav-settings').click();
+  await expect(page.getByTestId('settings-account')).toContainText('未登录');
+  await expect(page.getByRole('button', { name: '退出 grok.com 登录', exact: true })).toHaveCount(0);
+  await page.getByRole('button', { name: '用 grok.com 账号登录', exact: true }).click();
+  await expect.poll(async () => (await calls(page, 'login_browser')).length).toBe(1);
+});
+test('settings language switch updates the page title', async ({ page }) => {
+  await boot(page); await page.getByTestId('nav-settings').click();
+  await page.getByTestId('settings-locale').selectOption('en');
+  await expect(page.getByTestId('settings-page').getByRole('heading', { level: 2 })).toHaveText('Settings');
+  await page.getByTestId('settings-locale').selectOption('zh-TW');
+  await expect(page.getByTestId('settings-page').getByRole('heading', { level: 2 })).toHaveText('設定');
+});
+test('settings save bar stays in the compact viewport', async ({ page }) => {
+  await boot(page); await page.setViewportSize({ width: 960, height: 640 });
+  await page.getByTestId('nav-settings').click();
+  const box = await page.getByTestId('settings-save').boundingBox();
+  expect(box).toBeTruthy();
+  expect(box!.y + box!.height).toBeLessThanOrEqual(641);
 });
 test('plugin load failure is visible instead of empty success', async ({ page }) => {
   await boot(page, 'plugins-error'); await page.getByTestId('nav-plugins').click();
@@ -162,7 +193,7 @@ for (const locale of ['zh-CN', 'zh-TW', 'en']) {
   for (const size of [{ width: 960, height: 640 }, { width: 1320, height: 860 }]) {
     test(`layout ${locale} ${size.width}x${size.height}`, async ({ page }, info) => {
       await page.setViewportSize(size); await boot(page); await page.getByTestId('nav-settings').click();
-      await page.locator('.field select').first().selectOption(locale);
+      await page.getByTestId('settings-locale').selectOption(locale);
       for (const section of ['settings', 'skills', 'plugins', 'new']) {
         await page.getByTestId(`nav-${section}`).click();
         await page.screenshot({ path: info.outputPath(`${section}.png`), animations: 'disabled' });

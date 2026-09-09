@@ -60,7 +60,7 @@ impl AgentHub {
         req: StartSessionRequest,
     ) -> Result<StartSessionResult, String> {
         let grok = find_grok_binary(&app).ok_or_else(|| {
-            "Grok CLI was not found. Install Grok or bundle it with the app.".to_string()
+            "Grok engine was not found. Reinstall the app.".to_string()
         })?;
 
         let reused = match self.live().await {
@@ -205,12 +205,7 @@ impl AgentHub {
         let payload = json!({
             "jsonrpc": "2.0",
             "id": rpc_id,
-            "result": {
-                "outcome": {
-                    "outcome": "selected",
-                    "optionId": option_id
-                }
-            }
+            "result": permission_result(option_id)
         });
         write_line(&mut stdin, &payload).await
     }
@@ -293,6 +288,20 @@ impl SuppressGuard {
 impl Drop for SuppressGuard {
     fn drop(&mut self) {
         self.0.store(false, Ordering::SeqCst);
+    }
+}
+
+// ponytail: empty optionId = ACP cancelled; never invent an allow id
+fn permission_result(option_id: &str) -> Value {
+    if option_id.is_empty() {
+        json!({ "outcome": { "outcome": "cancelled" } })
+    } else {
+        json!({
+            "outcome": {
+                "outcome": "selected",
+                "optionId": option_id
+            }
+        })
     }
 }
 
@@ -478,5 +487,24 @@ async fn handle_message(
             };
             let _ = tx.send(payload);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::permission_result;
+
+    #[test]
+    fn empty_option_cancels() {
+        let value = permission_result("");
+        assert_eq!(value["outcome"]["outcome"], "cancelled");
+        assert!(value["outcome"].get("optionId").is_none());
+    }
+
+    #[test]
+    fn selected_keeps_id() {
+        let value = permission_result("allow_once");
+        assert_eq!(value["outcome"]["outcome"], "selected");
+        assert_eq!(value["outcome"]["optionId"], "allow_once");
     }
 }
