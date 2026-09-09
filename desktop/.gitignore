@@ -1,0 +1,43 @@
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+node_modules
+dist
+dist-ssr
+*.local
+src-tauri/target
+src-tauri/binaries
+src-tauri/gen
+test-results
+playwright-report
+blob-report
+artifacts/audit/html
+artifacts/audit/results
+artifacts/audit/visual-results
+artifacts/audit/*.log
+untitled-*
+
+# Secrets and local Grok/auth state — never commit keys
+.env
+.env.*
+*.pem
+*.key
+auth.json
+**/.grok/
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
