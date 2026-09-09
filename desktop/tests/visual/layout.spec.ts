@@ -38,6 +38,10 @@ test("chat shell stays aligned and inside the viewport", async ({ page }) => {
   const folderBg = await page.getByRole("button", { name: "app", exact: true }).evaluate((el) => getComputedStyle(el).backgroundColor);
   expect(folderBg === "rgba(0, 0, 0, 0)" || folderBg === "transparent").toBeTruthy();
   await expect(page).toHaveScreenshot("chat-empty.png", { fullPage: false });
+  await page.getByRole("button", { name: "app", exact: true }).click();
+  await expect(page.getByRole("button", { name: "Fix login flow" })).toHaveCount(0);
+  await page.getByRole("button", { name: "app", exact: true }).click();
+  await expect(page.getByRole("button", { name: "Fix login flow" })).toBeVisible();
   await page.getByTestId("sidebar-toggle").click();
   await expect(page.getByTestId("sidebar")).toHaveCount(0);
   await page.getByTestId("sidebar-toggle").click();
@@ -136,6 +140,12 @@ test("slash menu sits above the composer without overflowing", async ({ page }) 
 test("settings page keeps fields inside the main column", async ({ page }) => {
   await page.getByTestId("nav-settings").click();
   await expect(page.getByTestId("settings-page")).toBeVisible();
+  await expect(page.getByTestId("settings-account")).toBeVisible();
+  await expect(page.getByTestId("settings-api")).toBeVisible();
+  await expect(page.getByTestId("settings-agent")).toBeVisible();
+  await expect(page.getByTestId("settings-locale")).toBeVisible();
+  await expect(page.getByTestId("settings-engine")).toContainText("1.0.13");
+  await expect(page.getByTestId("settings-save")).toBeVisible();
   const pageBox = await page.getByTestId("settings-page").boundingBox();
   const mainBox = await page.getByTestId("main").boundingBox();
   expect(pageBox).toBeTruthy();
@@ -144,6 +154,20 @@ test("settings page keeps fields inside the main column", async ({ page }) => {
   expect(pageBox!.x + pageBox!.width).toBeLessThanOrEqual(mainBox!.x + mainBox!.width + 1);
   await assertNoOverflow(page);
   await expect(page).toHaveScreenshot("settings.png", { fullPage: false });
+});
+
+test("settings save bar stays on screen at a compact size", async ({ page }) => {
+  await page.setViewportSize({ width: 960, height: 640 });
+  await page.getByTestId("nav-settings").click();
+  await expect(page.getByTestId("settings-page")).toBeVisible();
+  const save = page.getByTestId("settings-save");
+  await expect(save).toBeVisible();
+  const box = await save.boundingBox();
+  expect(box).toBeTruthy();
+  expect(box!.y).toBeGreaterThanOrEqual(0);
+  expect(box!.y + box!.height).toBeLessThanOrEqual(640 + 1);
+  await assertNoOverflow(page);
+  await expect(page).toHaveScreenshot("settings-narrow.png", { fullPage: false });
 });
 
 test("skills and plugins pages do not overflow", async ({ page }) => {

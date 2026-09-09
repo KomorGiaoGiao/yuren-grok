@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Render a full-bleed macOS Grok icon: no pre-rounded corners, cropped glyph, 3D lighting.
+"""Render a Grok app icon: cropped glyph, 3D lighting, transparent squircle corners.
 
 Usage:
   python3 scripts/generate-macos-icon.py
@@ -29,9 +29,10 @@ OUT_DIR = Path(_args[0]) if _args else ROOT / "src-tauri" / "icons"
 
 WORK = 2048
 FINAL = 1024
-# Larger side of the glyph bbox, as a fraction of the canvas.
-# 0.80 fills more like neighboring Mac icons while keeping comet tips inside the squircle.
+# Larger side of the glyph bbox, as a fraction of the tile.
 COVERAGE = 0.80
+# Squircle size as a fraction of the canvas. <1 leaves transparent padding.
+TILE = 0.88
 
 
 def load_glyph_path() -> str:
@@ -208,28 +209,38 @@ def to_image(arr: np.ndarray) -> Image.Image:
     return Image.fromarray(u8, "RGB")
 
 
+def to_rgba(rgb: np.ndarray, alpha: np.ndarray) -> Image.Image:
+    u8 = (np.clip(rgb, 0.0, 1.0) * 255.0 + 0.5).astype(np.uint8)
+    a8 = (np.clip(alpha, 0.0, 1.0) * 255.0 + 0.5).astype(np.uint8)
+    return Image.fromarray(np.dstack([u8, a8]), "RGBA")
+
+
 def main() -> None:
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     mask = render_glyph_mask(WORK)
     bg = background(WORK)
     art = composite_glyph(bg, mask)
-    master = to_image(art).resize((FINAL, FINAL), Image.Resampling.LANCZOS)
+    tile = to_rgba(art, squircle_mask(WORK)).resize((FINAL, FINAL), Image.Resampling.LANCZOS)
+    inner = max(1, int(round(FINAL * TILE)))
+    master = Image.new("RGBA", (FINAL, FINAL), (0, 0, 0, 0))
+    scaled = tile.resize((inner, inner), Image.Resampling.LANCZOS)
+    off = (FINAL - inner) // 2
+    master.paste(scaled, (off, off), scaled)
 
     master_path = OUT_DIR / "icon-1024.png"
     master.save(master_path, "PNG")
 
     if "--preview" in sys.argv:
-        sm = squircle_mask(FINAL)
-        rgb = np.array(master, dtype=np.float32) / 255.0
+        rgba = np.array(master, dtype=np.float32) / 255.0
+        rgb, a = rgba[..., :3], rgba[..., 3]
         board = np.full((FINAL, FINAL, 3), 30 / 255.0, dtype=np.float32)
-        board = board * (1.0 - 0.45 * shift(blur(sm, 12.0), 10, 0))[..., None]
-        board = board * (1.0 - sm)[..., None] + rgb * sm[..., None]
+        board = board * (1.0 - 0.45 * shift(blur(a, 12.0), 10, 0))[..., None]
+        board = board * (1.0 - a)[..., None] + rgb * a[..., None]
         to_image(board).save(OUT_DIR / "preview-squircle.png", "PNG")
         to_image(board).resize((128, 128), Image.Resampling.LANCZOS).save(
             OUT_DIR / "preview-dock-128.png", "PNG"
         )
 
-    # verify corners of the actual icon are opaque dark, not white
     px = master.convert("RGBA")
     corners = [
         px.getpixel((0, 0)),

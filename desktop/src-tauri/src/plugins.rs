@@ -34,7 +34,7 @@ pub struct PluginSnapshot {
 }
 
 pub async fn list_plugins(app: &AppHandle) -> Result<PluginSnapshot, String> {
-    let grok = find_grok_binary(app).ok_or_else(|| "Grok CLI not found".to_string())?;
+    let grok = find_grok_binary(app).ok_or_else(|| "Grok engine not found".to_string())?;
 
     // Installed plugins only. `--available` pulls the whole marketplace catalog
     // and can freeze the UI; do not fetch it on page open.
@@ -53,7 +53,7 @@ pub async fn list_plugins(app: &AppHandle) -> Result<PluginSnapshot, String> {
 }
 
 pub async fn set_plugin_enabled(app: &AppHandle, name: &str, enabled: bool) -> Result<(), String> {
-    let grok = find_grok_binary(app).ok_or_else(|| "Grok CLI not found".to_string())?;
+    let grok = find_grok_binary(app).ok_or_else(|| "Grok engine not found".to_string())?;
     let cmd = if enabled { "enable" } else { "disable" };
     let text = run_text(&grok, &["plugin", cmd, name]).await?;
     let _ = text;

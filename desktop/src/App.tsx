@@ -82,6 +82,7 @@ export default function App() {
     () => localStorage.getItem("grok-desktop-sidebar") !== "0",
   );
   const [projectDirs, setProjectDirs] = useState<string[]>(() => readProjectDirs());
+  const [collapsedProjects, setCollapsedProjects] = useState<Record<string, boolean>>(() => readCollapsedProjects());
   const [sessionMeta, setSessionMeta] = useState<Record<string, SessionMeta>>(() => readSessionMeta());
   const [sessionMenu, setSessionMenu] = useState<{ session: SessionSummary; x: number; y: number } | null>(null);
   const [renameId, setRenameId] = useState<string | null>(null);
@@ -94,6 +95,7 @@ export default function App() {
   const composerBoxRef = useRef<HTMLDivElement>(null);
   const dragOverRef = useRef(false);
   const alwaysAllowRef = useRef(false);
+  const permissionRef = useRef<PermissionRequest | null>(null);
   const applyUpdateRef = useRef<(update: AgentUpdate) => void>(() => {});
   const ignoreTranscriptRef = useRef(false);
   const sessionIdRef = useRef<string | null>(null);
@@ -129,6 +131,10 @@ export default function App() {
   }, [alwaysAllow]);
 
   useEffect(() => {
+    permissionRef.current = permission;
+  }, [permission]);
+
+  useEffect(() => {
     sessionIdRef.current = sessionId;
   }, [sessionId]);
 
@@ -145,8 +151,23 @@ export default function App() {
   }, [projectDirs]);
 
   useEffect(() => {
+    localStorage.setItem("grok-desktop-collapsed-projects", JSON.stringify(collapsedProjects));
+  }, [collapsedProjects]);
+
+  useEffect(() => {
     localStorage.setItem("grok-desktop-session-meta", JSON.stringify(sessionMeta));
   }, [sessionMeta]);
+
+  useEffect(() => {
+    const cwd = sessions.find((session) => session.id === sessionId)?.cwd;
+    if (!cwd) return;
+    setCollapsedProjects((prev) => {
+      if (!prev[cwd]) return prev;
+      const next = { ...prev };
+      delete next[cwd];
+      return next;
+    });
+  }, [sessionId, sessions]);
 
   useEffect(() => {
     if (!sessionMenu) return;
@@ -402,6 +423,7 @@ export default function App() {
 
   function onAgentExit(payload: unknown) {
     const rec = payload as { reason?: string };
+    permissionRef.current = null;
     setPermission(null);
     finishTurn();
     setError(rec?.reason ? `${t(locale, "agentExited")} (${rec.reason})` : t(locale, "agentExited"));
@@ -425,9 +447,7 @@ export default function App() {
       options,
     };
     if (alwaysAllowRef.current) {
-      const allow =
-        options.find((o) => (o.kind || "").includes("allow"))?.optionId ||
-        options[0]?.optionId;
+      const allow = options.find((o) => (o.kind || "").includes("allow"))?.optionId;
       if (allow) {
         void api.respondPermission(data.rpcId, allow);
         return;
@@ -455,7 +475,6 @@ export default function App() {
     sessionIdRef.current = null;
     setError("");
     setLastFailed("");
-    setPermission(null);
     setSessionId(null);
     setBlocks([]);
     setDiffs([]);
@@ -467,6 +486,7 @@ export default function App() {
     setAlwaysAllow(false);
     setAttachments([]);
     setPage("chat");
+    await cancelPermission();
     try {
       await api.stopSession();
     } catch {
@@ -530,7 +550,7 @@ export default function App() {
     sessionIdRef.current = session.id;
     setError("");
     setLastFailed("");
-    setPermission(null);
+    await cancelPermission();
     setPage("chat");
     setProjectDir(session.cwd);
     rememberProject(session.cwd);
@@ -735,15 +755,29 @@ export default function App() {
     }
   }
 
-  async function choosePermission(optionId: string, always: boolean) {
-    if (!permission) return;
-    if (!optionId) {
-      setPermission(null);
-      return;
-    }
-    if (always) setAlwaysAllow(true);
-    await api.respondPermission(permission.rpcId, optionId);
+  async function cancelPermission() {
+    const current = permissionRef.current;
+    if (!current) return;
+    permissionRef.current = null;
     setPermission(null);
+    try {
+      await api.respondPermission(current.rpcId, "");
+    } catch {
+      /* agent may already be gone */
+    }
+  }
+
+  async function choosePermission(optionId: string, always: boolean) {
+    const current = permissionRef.current;
+    if (!current) return;
+    if (always) setAlwaysAllow(true);
+    permissionRef.current = null;
+    setPermission(null);
+    try {
+      await api.respondPermission(current.rpcId, optionId);
+    } catch (e) {
+      setError(String(e));
+    }
   }
 
   async function refreshExtras() {
@@ -818,6 +852,13 @@ export default function App() {
           })),
       ].slice(0, 12)
     : [];
+
+  const crumbTitle =
+    page === "skills" ? t(locale, "skills")
+    : page === "plugins" ? t(locale, "plugins")
+    : page === "settings" ? t(locale, "settings")
+    : current ? sessionLabel(current) : t(locale, "newSession");
+  const crumbPath = page === "chat" ? (current?.cwd || projectDir) : "";
 
   return (
     <div className={`app ${sidebarOpen ? "" : "sidebar-collapsed"}`.trim()} data-testid="app">
@@ -913,12 +954,21 @@ export default function App() {
                 <button
                   type="button"
                   className="project-row"
-                  onClick={() => setProjectDir(group.cwd)}
+                  aria-expanded={!collapsedProjects[group.cwd]}
+                  onClick={() => {
+                    setCollapsedProjects((prev) => {
+                      const next = { ...prev };
+                      if (next[group.cwd]) delete next[group.cwd];
+                      else next[group.cwd] = true;
+                      return next;
+                    });
+                  }}
                 >
+                  <span className="project-chevron" aria-hidden />
                   <IconFolder size={16} />
                   <span>{group.name}</span>
                 </button>
-                {group.items.length === 0 ? (
+                {collapsedProjects[group.cwd] ? null : group.items.length === 0 ? (
                   <div className="empty-project">{t(locale, "noConversations")}</div>
                 ) : (
                   group.items.map((session) => (
@@ -931,13 +981,15 @@ export default function App() {
                         setSessionMenu({ session, x: event.clientX, y: event.clientY });
                       }}
                     >
-                      {busy && session.id === sessionId ? (
-                        <span className="wait-spin" data-testid="session-wait" />
-                      ) : sessionMeta[session.id]?.unread ? (
-                        <span className="unread-dot" />
-                      ) : sessionMeta[session.id]?.pinned ? (
-                        <IconPin size={12} />
-                      ) : null}
+                      <span className="session-mark">
+                        {busy && session.id === sessionId ? (
+                          <span className="wait-spin" data-testid="session-wait" />
+                        ) : sessionMeta[session.id]?.unread ? (
+                          <span className="unread-dot" />
+                        ) : sessionMeta[session.id]?.pinned ? (
+                          <IconPin size={12} />
+                        ) : null}
+                      </span>
                       {renameId === session.id ? (
                         <input
                           className="session-rename"
@@ -980,7 +1032,7 @@ export default function App() {
                     setSessionMenu({ session, x: event.clientX, y: event.clientY });
                   }}
                 >
-                  <IconArchive size={12} />
+                  <span className="session-mark"><IconArchive size={12} /></span>
                   <span className="session-title">{sessionLabel(session)}</span>
                 </button>
               ))}
@@ -1005,13 +1057,16 @@ export default function App() {
           )}
           <div className="crumb" data-tauri-drag-region onMouseDown={(e) => void dragWindow(e)}>
             <strong>
-              {busy ? (
-                <span className="wait-spin" data-testid="turn-wait" />
-              ) : (
-                <span className={`status-dot ${permission ? "wait" : sessionId ? "on" : ""}`} />
-              )}
-              {current ? sessionLabel(current) : t(locale, "newSession")}
+              {page === "chat" ? (
+                busy ? (
+                  <span className="wait-spin" data-testid="turn-wait" />
+                ) : (
+                  <span className={`status-dot ${permission ? "wait" : sessionId ? "on" : ""}`} />
+                )
+              ) : null}
+              {crumbTitle}
             </strong>
+            {crumbPath ? <em>{crumbPath}</em> : null}
           </div>
         </header>
 
@@ -1049,7 +1104,7 @@ export default function App() {
                   if (atBottom !== followBottom) setFollowBottom(atBottom);
                 }}
               >
-                {connecting ? <div className="empty-side">{t(locale, "connecting")}</div> : null}
+                {connecting ? <div className="chat-status">{t(locale, "connecting")}</div> : null}
                 {blocks.length === 0 && !connecting ? (
                   <div className="hero">
                     <h2>{t(locale, "emptyChatTitle")}</h2>
@@ -1107,7 +1162,7 @@ export default function App() {
                       >
                         <b>
                           /{item.name}
-                          <span className="tag" style={{ marginLeft: 8 }}>
+                          <span className="tag">
                             {item.kind === "skill" ? t(locale, "skillBadge") : t(locale, "commandBadge")}
                           </span>
                         </b>
@@ -1349,8 +1404,10 @@ export default function App() {
 
         {page === "skills" ? (
           <div className="page" data-testid="skills-page">
-            <h2>{t(locale, "skills")}</h2>
-            <p className="lead">{t(locale, "skillsLead")}</p>
+            <header className="page-head">
+              <h2>{t(locale, "skills")}</h2>
+              <p className="lead">{t(locale, "skillsLead")}</p>
+            </header>
             {skills.length === 0 ? (
               <p className="lead">{t(locale, "emptySkills")}</p>
             ) : (
@@ -1387,14 +1444,16 @@ export default function App() {
 
         {page === "plugins" ? (
           <div className="page" data-testid="plugins-page">
-            <h2>{t(locale, "plugins")}</h2>
-            <p className="lead">
-              {pluginsError
-                ? t(locale, "pluginsLoadError")
-                : (plugins?.installed || []).length
-                  ? t(locale, "pluginsLeadInstalled")
-                  : t(locale, "pluginsLead")}
-            </p>
+            <header className="page-head">
+              <h2>{t(locale, "plugins")}</h2>
+              <p className="lead">
+                {pluginsError
+                  ? t(locale, "pluginsLoadError")
+                  : (plugins?.installed || []).length
+                    ? t(locale, "pluginsLeadInstalled")
+                    : t(locale, "pluginsLead")}
+              </p>
+            </header>
             {pluginsError ? (
               <div className="banner">
                 <span>{pluginsError}</span>
@@ -1403,17 +1462,21 @@ export default function App() {
                 </button>
               </div>
             ) : null}
-            {(plugins?.marketplaces || []).map((m) => (
-              <button
-                key={m.name}
-                type="button"
-                className="marketplace-link"
-                onClick={() => m.source && void api.openPath(m.source)}
-              >
-                {t(locale, "marketplace")}: {m.name}
-                {m.source ? ` · ${m.source}` : ""}
-              </button>
-            ))}
+            {(plugins?.marketplaces || []).length ? (
+              <div className="marketplace">
+                {(plugins?.marketplaces || []).map((m) => (
+                  <button
+                    key={m.name}
+                    type="button"
+                    className="marketplace-link"
+                    onClick={() => m.source && void api.openPath(m.source)}
+                  >
+                    {t(locale, "marketplace")}: {m.name}
+                    {m.source ? ` · ${m.source}` : ""}
+                  </button>
+                ))}
+              </div>
+            ) : null}
             <PluginList
               locale={locale}
               title={t(locale, "installed")}
@@ -1427,10 +1490,10 @@ export default function App() {
               <PluginList locale={locale} title={t(locale, "available")} items={plugins?.available || []} />
             ) : null}
             {!pluginsError && (plugins?.installed || []).length === 0 ? (
-              <>
-                <p className="lead">{t(locale, "emptyPlugins")}</p>
-                <p className="lead">{t(locale, "pluginInstallHint")}</p>
-              </>
+              <div className="empty-note">
+                <p>{t(locale, "emptyPlugins")}</p>
+                <p>{t(locale, "pluginInstallHint")}</p>
+              </div>
             ) : null}
           </div>
         ) : null}
@@ -1600,91 +1663,125 @@ function SettingsPage({
   }
 
   return (
-    <div className="page" data-testid="settings-page">
-      <h2>{t(locale, "settingsTitle")}</h2>
-      <p className="lead">{t(locale, "settingsLead")}</p>
-      <div className="card">
-        <label className="field">
-          <span>{t(locale, "language")}</span>
-          <select value={locale} onChange={(e) => onLocaleChange(e.target.value as Locale)}>
-            <option value="zh-CN">简体中文</option>
-            <option value="zh-TW">繁體中文</option>
-            <option value="en">English</option>
-          </select>
-        </label>
-      </div>
-      <div className="card">
+    <form
+      className="page settings"
+      data-testid="settings-page"
+      onSubmit={(event) => {
+        event.preventDefault();
+        void save();
+      }}
+    >
+      <header className="settings-head">
+        <div>
+          <h2>{t(locale, "settingsTitle")}</h2>
+          <p className="lead">{t(locale, "settingsLead")}</p>
+        </div>
+        <div className="settings-head-meta">
+          <label className="settings-locale">
+            <span className="vh">{t(locale, "language")}</span>
+            <select
+              data-testid="settings-locale"
+              value={locale}
+              onChange={(e) => onLocaleChange(e.target.value as Locale)}
+            >
+              <option value="zh-CN">简体中文</option>
+              <option value="zh-TW">繁體中文</option>
+              <option value="en">English</option>
+            </select>
+          </label>
+          <div className="settings-chip" data-testid="settings-engine">
+            <span className={`status-dot ${status?.found ? "on" : ""}`} />
+            {status?.found ? status.version || t(locale, "grokFound") : t(locale, "grokMissing")}
+          </div>
+        </div>
+      </header>
+
+      <section className="settings-section" data-testid="settings-account">
+        <h3>{t(locale, "settingsAccount")}</h3>
+        <p className="lead">{settings.browserAuth ? t(locale, "browserLoggedIn") : t(locale, "signedOut")}</p>
+        <div className="row">
+          {settings.browserAuth ? (
+            <button
+              type="button"
+              className="btn ghost"
+              onClick={() => {
+                void api.logoutBrowser()
+                  .then(() => refreshAuth())
+                  .catch((e) => setNote(String(e)));
+              }}
+            >
+              {t(locale, "browserLogout")}
+            </button>
+          ) : (
+            <button
+              type="button"
+              className="btn"
+              onClick={() => {
+                void (async () => {
+                  try {
+                    await api.loginBrowser();
+                    for (let i = 0; i < 20; i += 1) {
+                      await new Promise((resolve) => window.setTimeout(resolve, 500));
+                      const next = await api.getSettings();
+                      onSaved(next);
+                      if (next.browserAuth) return;
+                    }
+                  } catch (e) {
+                    setNote(String(e));
+                  }
+                })();
+              }}
+            >
+              {t(locale, "browserLogin")}
+            </button>
+          )}
+        </div>
+      </section>
+
+      <section className="settings-section" data-testid="settings-api">
+        <h3>{t(locale, "settingsApi")}</h3>
+        <p className="lead">{t(locale, "apiHint")}</p>
         <label className="field">
           <span>{t(locale, "baseUrl")}</span>
           <input value={baseUrl} onChange={(e) => setBaseUrl(e.target.value)} placeholder="https://api.x.ai/v1" />
         </label>
         <label className="field">
-          <span>{t(locale, "model")}</span>
-          <input value={model} onChange={(e) => setModel(e.target.value)} />
-        </label>
-        <label className="field">
-          <span>{t(locale, "effort")}</span>
-          <select value={effort} onChange={(e) => setEffort(e.target.value)}>
-            {["none", "minimal", "low", "medium", "high", "xhigh", "max"].map((id) => (
-              <option key={id} value={id}>{effortLabel(locale, id)}</option>
-            ))}
-          </select>
-        </label>
-        <label className="field">
           <span>{t(locale, "apiKey")}</span>
           <input
             type="password"
+            autoComplete="off"
             value={apiKey}
             onChange={(e) => setApiKey(e.target.value)}
-            placeholder={settings.apiKeyConfigured ? settings.apiKeyPreview : ""}
+            placeholder={settings.apiKeyConfigured ? settings.apiKeyPreview : t(locale, "notConfigured")}
           />
         </label>
-        <div className="row settings-save">
-          <button className="btn primary" disabled={saving} onClick={() => void save()}>{t(locale, "save")}</button>
-          {note ? <span className={note === t(locale, "saved") ? "preview" : "banner-inline"}>{note}</span> : null}
-          <span className="preview">
-            {status?.found ? `${t(locale, "version")}: ${status.version || ""}` : t(locale, "grokMissing")}
-          </span>
+      </section>
+
+      <section className="settings-section" data-testid="settings-agent">
+        <h3>{t(locale, "settingsAgent")}</h3>
+        <div className="settings-grid">
+          <label className="field">
+            <span>{t(locale, "model")}</span>
+            <input value={model} onChange={(e) => setModel(e.target.value)} />
+          </label>
+          <label className="field">
+            <span>{t(locale, "effort")}</span>
+            <select value={effort} onChange={(e) => setEffort(e.target.value)}>
+              {["none", "minimal", "low", "medium", "high", "xhigh", "max"].map((id) => (
+                <option key={id} value={id}>{effortLabel(locale, id)}</option>
+              ))}
+            </select>
+          </label>
         </div>
-      </div>
-      <div className="card">
-        <p className="lead">
-          {settings.browserAuth ? t(locale, "browserLoggedIn") : t(locale, "browserLogin")}
-        </p>
-        <div className="row">
-          <button
-            className="btn"
-            onClick={() => {
-              void (async () => {
-                try {
-                  await api.loginBrowser();
-                  for (let i = 0; i < 20; i += 1) {
-                    await new Promise((resolve) => window.setTimeout(resolve, 500));
-                    const next = await api.getSettings();
-                    onSaved(next);
-                    if (next.browserAuth) return;
-                  }
-                } catch (e) {
-                  setNote(String(e));
-                }
-              })();
-            }}
-          >
-            {t(locale, "browserLogin")}
-          </button>
-          <button
-            className="btn ghost"
-            onClick={() => {
-              void api.logoutBrowser()
-                .then(() => refreshAuth())
-                .catch((e) => setNote(String(e)));
-            }}
-          >
-            {t(locale, "browserLogout")}
-          </button>
-        </div>
-      </div>
-    </div>
+      </section>
+
+      <footer className="settings-foot" data-testid="settings-save">
+        <button type="submit" className="btn primary" disabled={saving}>{t(locale, "save")}</button>
+        {note ? (
+          <span className={note === t(locale, "saved") ? "preview" : "banner-inline"}>{note}</span>
+        ) : null}
+      </footer>
+    </form>
   );
 }
 
@@ -1702,7 +1799,7 @@ function PluginList({
   if (items.length === 0) return null;
   return (
     <div className="list">
-      <h3 style={{ margin: "18px 0 0" }}>{title}</h3>
+      <h3 className="list-title">{title}</h3>
       {items.map((plugin) => (
         <div className="item" key={plugin.name}>
           <div>
@@ -1884,6 +1981,19 @@ function readProjectDirs(): string[] {
     return parsed.filter((item): item is string => typeof item === "string" && item.length > 0);
   } catch {
     return [];
+  }
+}
+
+function readCollapsedProjects(): Record<string, boolean> {
+  try {
+    const raw = localStorage.getItem("grok-desktop-collapsed-projects");
+    const parsed = raw ? JSON.parse(raw) : {};
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
+    return Object.fromEntries(
+      Object.entries(parsed).filter((entry): entry is [string, boolean] => entry[1] === true),
+    );
+  } catch {
+    return {};
   }
 }
 

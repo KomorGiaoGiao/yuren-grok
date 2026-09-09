@@ -25,22 +25,37 @@ pub fn auth_path() -> PathBuf {
     grok_home().join("auth.json")
 }
 
+fn grok_filename() -> &'static str {
+    if cfg!(windows) {
+        "grok.exe"
+    } else {
+        "grok"
+    }
+}
+
 pub fn find_grok_binary(app: &AppHandle) -> Option<PathBuf> {
     let mut candidates: Vec<PathBuf> = Vec::new();
 
+    // Sidecar from bundle.externalBin — next to the app executable.
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            candidates.push(dir.join(grok_filename()));
+        }
+    }
+
     if let Ok(resource) = app.path().resource_dir() {
-        candidates.push(resource.join("grok"));
-        candidates.push(resource.join("binaries").join("grok"));
+        candidates.push(resource.join(grok_filename()));
+        candidates.push(resource.join("binaries").join(grok_filename()));
     }
 
     let home = grok_home();
-    candidates.push(home.join("bin").join("grok"));
+    candidates.push(home.join("bin").join(grok_filename()));
 
-    if let Ok(path) = which("grok") {
+    if let Ok(path) = which(grok_filename()) {
         candidates.push(path);
     }
 
-    candidates.into_iter().find(|p| p.exists())
+    candidates.into_iter().find(|p| p.is_file())
 }
 
 pub fn workspace_root() -> PathBuf {

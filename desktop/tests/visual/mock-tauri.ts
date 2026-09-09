@@ -3,6 +3,7 @@ import type { Page } from "@playwright/test";
 export async function installTauriMocks(page: Page) {
   await page.addInitScript(() => {
     localStorage.setItem("grok-desktop-locale", "zh-CN");
+    localStorage.removeItem("grok-desktop-collapsed-projects");
 
     const callbacks = new Map<number, (data: unknown) => void>();
 
@@ -130,6 +131,8 @@ export async function installTauriMocks(page: Page) {
         lastProjectDir: "",
       },
       stop_session: null,
+      login_browser: "started",
+      logout_browser: null,
     };
 
     (window as unknown as { __TAURI_INTERNALS__: Record<string, unknown> }).__TAURI_INTERNALS__ = {
